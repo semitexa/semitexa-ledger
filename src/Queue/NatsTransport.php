@@ -10,7 +10,7 @@ use Semitexa\Ledger\Nats\ClusterRegistry;
 /**
  * NATS JetStream implementation of the existing QueueTransportInterface.
  *
- * Drop-in replacement for RabbitMqTransport. Set EVENTS_TRANSPORT=nats to
+ * NATS-based async queue transport. Set EVENTS_TRANSPORT=nats to
  * activate. Queue names become NATS subjects under the semitexa.queue.> prefix.
  *
  * Messages are published to JetStream (stream must be configured to capture

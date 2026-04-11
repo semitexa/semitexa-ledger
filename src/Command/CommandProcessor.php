@@ -144,8 +144,12 @@ final class CommandProcessor
         $args = [];
         foreach ($ctor->getParameters() as $param) {
             $name = $param->getName();
+            $snakeName = strtolower(preg_replace('/[A-Z]/', '_$0', $name) ?? $name);
+
             if (array_key_exists($name, $payload)) {
                 $args[] = $payload[$name];
+            } elseif (array_key_exists($snakeName, $payload)) {
+                $args[] = $payload[$snakeName];
             } elseif ($param->isDefaultValueAvailable()) {
                 $args[] = $param->getDefaultValue();
             } elseif ($param->allowsNull()) {
