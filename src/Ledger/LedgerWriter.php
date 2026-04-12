@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Ledger;
 
+use Semitexa\Core\Support\PayloadSerializer;
 use Semitexa\Ledger\Attribute\OwnedAggregate;
 use Semitexa\Ledger\Attribute\Propagated;
 use Semitexa\Ledger\Dto\LedgerEvent;
@@ -51,6 +52,7 @@ final class LedgerWriter
     public function append(object $event): ?LedgerEvent
     {
         $eventClass = get_class($event);
+        $payload = PayloadSerializer::toArray($event);
 
         $propagated = $this->readPropagated($eventClass);
         if ($propagated === null) {
@@ -60,11 +62,10 @@ final class LedgerWriter
         $domain    = $propagated->domain ?? $this->deriveDomain($eventClass);
         $eventType = $this->deriveEventType($eventClass);
 
-        [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass);
+        [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
 
         $now       = $this->nowMicros();
         $eventId   = UuidV7::generate();
-        $payload   = $this->objectToArray($event);
         $metadata  = ['timestamp' => $now, 'node_id' => $this->nodeId];
 
         $ledgerEvent = $this->db->transaction(function (LedgerConnection $db) use (
@@ -174,7 +175,7 @@ final class LedgerWriter
     /**
      * @return array{0: string|null, 1: string|null} [$aggregateType, $aggregateId]
      */
-    private function resolveAggregate(object $event, string $eventClass): array
+    private function resolveAggregate(object $event, string $eventClass, array $payload): array
     {
         $ownedAttr = $this->readOwnedAggregate($eventClass);
         if ($ownedAttr === null) {
@@ -182,7 +183,7 @@ final class LedgerWriter
         }
 
         $idField = $ownedAttr->idField;
-        $aggregateId = $this->readProperty($event, $idField);
+        $aggregateId = $this->readProperty($event, $idField, $payload);
 
         if ($aggregateId === null) {
             throw new \InvalidArgumentException(
@@ -239,17 +240,31 @@ final class LedgerWriter
         return $this->ownedAggregateCache[$eventClass];
     }
 
-    private function readProperty(object $event, string $property): ?string
+    private function readProperty(object $event, string $property, array $payload): ?string
     {
-        if (property_exists($event, $property)) {
-            $value = $event->{$property};
-            return $value !== null ? (string) $value : null;
+        $candidates = [$property];
+
+        $camel = lcfirst(str_replace('_', '', ucwords($property, '_')));
+        if (!in_array($camel, $candidates, true)) {
+            $candidates[] = $camel;
         }
 
-        // Try snake_case → camelCase conversion.
-        $camel = lcfirst(str_replace('_', '', ucwords($property, '_')));
-        if (property_exists($event, $camel)) {
-            $value = $event->{$camel};
+        foreach ($candidates as $candidate) {
+            if (array_key_exists($candidate, $payload)) {
+                $value = $payload[$candidate];
+                return $value !== null ? (string) $value : null;
+            }
+        }
+
+        foreach ($candidates as $candidate) {
+            if (!property_exists($event, $candidate)) {
+                continue;
+            }
+
+            $reflectionProperty = new \ReflectionProperty($event, $candidate);
+            $reflectionProperty->setAccessible(true);
+            $value = $reflectionProperty->getValue($event);
+
             return $value !== null ? (string) $value : null;
         }
 
@@ -285,16 +300,6 @@ final class LedgerWriter
     {
         $shortName = substr($eventClass, strrpos($eventClass, '\\') + 1);
         return strtolower(preg_replace('/(?<!^)[A-Z]/', '_$0', $shortName) ?? $shortName);
-    }
-
-    /**
-     * Convert an object to an associative array (public properties only).
-     *
-     * @return array<string, mixed>
-     */
-    private function objectToArray(object $obj): array
-    {
-        return json_decode(json_encode($obj, JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR);
     }
 
     private function nowMicros(): string

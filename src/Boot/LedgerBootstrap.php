@@ -25,6 +25,7 @@ use Semitexa\Ledger\Ownership\AggregateOwnershipService;
 use Semitexa\Ledger\Ownership\OwnershipCache;
 use Semitexa\Ledger\Queue\DualWriteTransport;
 use Semitexa\Ledger\Queue\NatsTransportFactory;
+use Semitexa\Orm\Connection\ConnectionRegistry;
 
 /**
  * Wires up the ledger on each Swoole worker startup:
@@ -37,15 +38,17 @@ use Semitexa\Ledger\Queue\NatsTransportFactory;
  *  6. Start CommandProcessor NATS subscription loop.
  *
  * Required environment variables:
+ *   LEDGER_ENABLED    — set to 1/true/yes/on to enable the ledger explicitly
  *   LEDGER_NODE_ID    — unique node identifier (e.g. "store-a")
  *   LEDGER_HMAC_KEY   — HMAC secret for ledger signing
  *   NATS_URL / NATS_PRIMARY_URL — primary NATS server
  *
  * Optional:
  *   LEDGER_DB_PATH         — SQLite file path (default: /var/lib/semitexa/ledger/{node}.sqlite)
+ *   LEDGER_DB_CONNECTION   — ORM connection name for aggregate_ownership table (default: "default")
  *   NATS_SECONDARY_URL     — enables secondary cluster for HA
- *   EVENTS_DUAL_PRIMARY    — enables dual-write mode (e.g. "rabbitmq")
- *   EVENTS_DUAL_SECONDARY  — secondary transport name (e.g. "nats")
+ *   EVENTS_DUAL_PRIMARY    — enables dual-write mode (primary transport name)
+ *   EVENTS_DUAL_SECONDARY  — secondary transport name
  */
 #[AsServerLifecycleListener(
     phase: ServerLifecyclePhase::WorkerStartAfterContainer->value,
@@ -55,6 +58,10 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
 {
     public function handle(ServerLifecycleContext $context): void
     {
+        if (!$this->shouldBootLedger()) {
+            return;
+        }
+
         $nodeId  = $this->requireEnv('LEDGER_NODE_ID');
         $hmacKey = $this->requireEnv('LEDGER_HMAC_KEY');
         $dbPath  = (string) (getenv('LEDGER_DB_PATH') ?: "/var/lib/semitexa/ledger/{$nodeId}.sqlite");
@@ -97,9 +104,16 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
         // Shared services.
         $container      = ContainerFactory::get();
         $ownershipCache = new OwnershipCache();
-        $ownership      = new AggregateOwnershipService(
+
+        // Resolve the ORM database adapter for the aggregate_ownership table.
+        // By default uses the 'default' connection; override via LEDGER_DB_CONNECTION env var.
+        $dbConnection = (string) (getenv('LEDGER_DB_CONNECTION') ?: 'default');
+        $connectionRegistry = $container->get(ConnectionRegistry::class);
+        $ownershipAdapter = $connectionRegistry->manager($dbConnection)->getAdapter();
+
+        $ownership = new AggregateOwnershipService(
             $nodeId,
-            $container->get(\Semitexa\Orm\Adapter\DatabaseAdapterInterface::class),
+            $ownershipAdapter,
             $ownershipCache,
         );
 
@@ -141,6 +155,25 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
     // Helpers
     // -------------------------------------------------------------------------
 
+    private function shouldBootLedger(): bool
+    {
+        $enabled = getenv('LEDGER_ENABLED');
+
+        if ($enabled !== false && $enabled !== '') {
+            if ($this->isTruthy($enabled)) {
+                return true;
+            }
+
+            if ($this->isFalsy($enabled)) {
+                return false;
+            }
+        }
+
+        return getenv('LEDGER_NODE_ID') !== false
+            && getenv('LEDGER_HMAC_KEY') !== false
+            && (getenv('NATS_URL') !== false || getenv('NATS_PRIMARY_URL') !== false);
+    }
+
     private function requireEnv(string $key): string
     {
         $value = getenv($key);
@@ -150,6 +183,16 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
             );
         }
         return $value;
+    }
+
+    private function isTruthy(string $value): bool
+    {
+        return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private function isFalsy(string $value): bool
+    {
+        return in_array(strtolower(trim($value)), ['0', 'false', 'no', 'off'], true);
     }
 
     private function ensureDir(string $dbPath): void

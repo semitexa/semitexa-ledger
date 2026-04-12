@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Command;
 
 use Semitexa\Core\Container\ContainerFactory;
-use Semitexa\Core\Event\EventDispatcherInterface;
+use Semitexa\Core\Support\PayloadSerializer;
 use Semitexa\Ledger\Attribute\AsAggregateCommand;
 use Semitexa\Ledger\Exception\AggregateNotFoundException;
 use Semitexa\Ledger\Exception\OwnerNodeUnavailableException;
@@ -107,9 +107,9 @@ final class CommandBus
         /** @var AsAggregateCommand $meta */
         $meta        = $attrs[0]->newInstance();
         $idField     = $meta->aggregateIdField;
-        $aggregateId = property_exists($command, $idField)
-            ? (string) $command->{$idField}
-            : throw new \InvalidArgumentException("Command {$class} missing property '{$idField}'");
+        $payload     = PayloadSerializer::toArray($command);
+        $aggregateId = $this->readValue($command, $idField, $payload)
+            ?? throw new \InvalidArgumentException("Command {$class} missing property '{$idField}'");
 
         return [$meta->aggregateType, $aggregateId];
     }
@@ -137,15 +137,49 @@ final class CommandBus
         $attrs = (new \ReflectionClass($class))->getAttributes(AsAggregateCommand::class);
         /** @var AsAggregateCommand $meta */
         $meta = $attrs[0]->newInstance();
+        $payload = PayloadSerializer::toArray($command);
 
         return json_encode([
             'command_id'     => bin2hex(random_bytes(16)),
             'command_class'  => $class,
             'aggregate_type' => $meta->aggregateType,
-            'aggregate_id'   => $command->{$meta->aggregateIdField},
+            'aggregate_id'   => $this->readValue($command, $meta->aggregateIdField, $payload),
             'source_node'    => $this->nodeId,
-            'payload'        => json_decode(json_encode($command, JSON_THROW_ON_ERROR), true),
+            'payload'        => $payload,
             'sent_at'        => gmdate('Y-m-d\TH:i:s\Z'),
         ], JSON_THROW_ON_ERROR);
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private function readValue(object $command, string $field, array $payload): ?string
+    {
+        $candidates = [$field];
+        $camel = lcfirst(str_replace('_', '', ucwords($field, '_')));
+        if (!in_array($camel, $candidates, true)) {
+            $candidates[] = $camel;
+        }
+
+        foreach ($candidates as $candidate) {
+            if (array_key_exists($candidate, $payload)) {
+                $value = $payload[$candidate];
+                return $value !== null ? (string) $value : null;
+            }
+        }
+
+        foreach ($candidates as $candidate) {
+            if (!property_exists($command, $candidate)) {
+                continue;
+            }
+
+            $property = new \ReflectionProperty($command, $candidate);
+            $property->setAccessible(true);
+            $value = $property->getValue($command);
+
+            return $value !== null ? (string) $value : null;
+        }
+
+        return null;
     }
 }

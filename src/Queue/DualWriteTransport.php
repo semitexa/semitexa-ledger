@@ -7,16 +7,16 @@ namespace Semitexa\Ledger\Queue;
 use Semitexa\Core\Queue\QueueTransportInterface;
 
 /**
- * Dual-write transport for the RabbitMQ → NATS migration Phase 1.
+ * Dual-write transport for zero-downtime queue migrations.
  *
  * Publishes to both primary and secondary transports. Consumers read
  * from the primary only. If secondary publish fails it is logged and
- * silently skipped — NATS is non-critical during this migration phase.
+ * silently skipped.
  *
  * Activation:
  *   EVENTS_TRANSPORT=dual
- *   EVENTS_DUAL_PRIMARY=rabbitmq
- *   EVENTS_DUAL_SECONDARY=nats
+ *   EVENTS_DUAL_PRIMARY=nats
+ *   EVENTS_DUAL_SECONDARY=<other-transport>
  */
 final class DualWriteTransport implements QueueTransportInterface
 {
