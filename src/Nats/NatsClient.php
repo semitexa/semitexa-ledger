@@ -43,7 +43,7 @@ final class NatsClient
      */
     public function connect(): void
     {
-        $this->client->connect();
+        $this->client->ping();
     }
 
     /**
@@ -77,10 +77,14 @@ final class NatsClient
     public function request(string $subject, string $payload, float $timeoutSeconds = 5.0): string
     {
         $response = null;
+        $previousTimeout = $this->client->configuration->timeout;
+        $this->client->setTimeout($timeoutSeconds);
 
         $this->client->request($subject, $payload, function (string $body) use (&$response): void {
             $response = $body;
-        }, $timeoutSeconds);
+        });
+
+        $this->client->setTimeout($previousTimeout);
 
         if ($response === null) {
             throw new \RuntimeException("NATS request to '{$subject}' timed out after {$timeoutSeconds}s");
@@ -115,6 +119,10 @@ final class NatsClient
         if (isset($config['duplicate_window'])) {
             $streamConfig->setDuplicateWindow($config['duplicate_window']);
         }
+
+        if (!$stream->exists()) {
+            $stream->create();
+        }
     }
 
     /**
@@ -133,7 +141,7 @@ final class NatsClient
         $consumer = $stream->getConsumer($consumerName);
 
         $cfg = $consumer->getConfiguration();
-        $cfg->setFilterSubject($filterSubject);
+        $cfg->setSubjectFilter($filterSubject);
         $cfg->setAckPolicy('explicit');
 
         if ($startSequence > 0) {
@@ -142,6 +150,8 @@ final class NatsClient
         } else {
             $cfg->setDeliverPolicy(DeliverPolicy::ALL);
         }
+
+        $consumer->create();
     }
 
     /**

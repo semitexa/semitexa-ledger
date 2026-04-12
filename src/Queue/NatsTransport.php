@@ -20,6 +20,7 @@ final class NatsTransport implements QueueTransportInterface
 {
     private const SUBJECT_PREFIX = 'semitexa.queue.';
     private const STREAM_NAME    = 'QUEUE';
+    private bool $streamReady = false;
 
     public function __construct(
         private readonly ClusterRegistry $clusters,
@@ -27,6 +28,7 @@ final class NatsTransport implements QueueTransportInterface
 
     public function publish(string $queueName, string $payload): void
     {
+        $this->ensureQueueStream();
         $subject = self::SUBJECT_PREFIX . $queueName;
         $client  = $this->primaryClient();
         $client->jetStreamPublish($subject, $payload);
@@ -34,6 +36,7 @@ final class NatsTransport implements QueueTransportInterface
 
     public function consume(string $queueName, callable $callback): void
     {
+        $this->ensureQueueStream();
         $subject      = self::SUBJECT_PREFIX . $queueName;
         $consumerName = 'queue-' . preg_replace('/[^a-z0-9-]/', '-', strtolower($queueName));
         $client       = $this->primaryClient();
@@ -71,5 +74,18 @@ final class NatsTransport implements QueueTransportInterface
         }
 
         return $clusters[0]['client'];
+    }
+
+    private function ensureQueueStream(): void
+    {
+        if ($this->streamReady) {
+            return;
+        }
+
+        $this->primaryClient()->ensureStream(self::STREAM_NAME, [
+            'subjects' => [self::SUBJECT_PREFIX . '>'],
+        ]);
+
+        $this->streamReady = true;
     }
 }
