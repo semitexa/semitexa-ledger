@@ -12,7 +12,7 @@ use Semitexa\Orm\Attribute\Index;
 use Semitexa\Orm\Attribute\PrimaryKey;
 
 /**
- * ORM table model for aggregate_ownership.
+ * ORM resource model for aggregate_ownership.
  *
  * Defines the schema for the main-DB table that tracks which node
  * owns each aggregate. Used by orm:sync to create/migrate the table.
@@ -29,7 +29,7 @@ use Semitexa\Orm\Attribute\PrimaryKey;
 #[Connection('default')]
 #[Index(columns: ['aggregate_type', 'aggregate_id'], unique: true, name: 'uniq_aggregate_ownership')]
 #[Index(columns: ['owner_node_id'], unique: false, name: 'idx_aggregate_ownership_owner')]
-final readonly class AggregateOwnershipTableModel
+final readonly class AggregateOwnershipResourceModel
 {
     public function __construct(
         #[PrimaryKey(strategy: 'auto')]
