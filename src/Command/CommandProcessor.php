@@ -12,6 +12,9 @@ use Semitexa\Ledger\Ownership\AggregateOwnershipService;
 /**
  * Handles incoming aggregate commands on the owner node.
  *
+ * SECURITY: Only command classes registered in CommandRegistry (i.e. annotated with
+ * #[AsAggregateCommand]) may be instantiated from incoming NATS messages (VULN-002).
+ *
  * Two paths:
  *
  *   handleLocally()   — Called by CommandBus when this node is the owner.
@@ -37,6 +40,7 @@ final class CommandProcessor
         private readonly string $nodeId,
         private readonly ClusterRegistry $clusters,
         private readonly AggregateOwnershipService $ownership,
+        private readonly CommandRegistry $commandRegistry,
     ) {}
 
     /**
@@ -118,7 +122,11 @@ final class CommandProcessor
             $envelope = json_decode($rawPayload, true, 512, JSON_THROW_ON_ERROR);
             $commandClass = $envelope['command_class'] ?? null;
 
-            if ($commandClass === null || !class_exists($commandClass)) {
+            if ($commandClass === null) {
+                return CommandResult::error('Missing command_class');
+            }
+
+            if (!$this->commandRegistry->isRegistered($commandClass)) {
                 return CommandResult::error("Unknown command class: {$commandClass}");
             }
 
