@@ -61,17 +61,15 @@ final class LedgerWriter
 
         $domain    = $propagated->domain ?? $this->deriveDomain($eventClass);
         $eventType = $this->deriveEventType($eventClass);
+        [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
 
         $now       = $this->nowMicros();
         $eventId   = UuidV7::generate();
         $metadata  = ['timestamp' => $now, 'node_id' => $this->nodeId];
 
         $ledgerEvent = $this->db->transaction(function (LedgerConnection $db) use (
-            $event, $eventClass, $eventId, $domain, $eventType, $payload, $metadata, $now
+            $aggregateId, $aggregateType, $eventId, $domain, $eventType, $payload, $metadata, $now
         ): LedgerEvent {
-            // Ownership gate is checked inside the exclusive transaction to prevent
-            // TOCTOU races between concurrent Swoole workers (VULN-005).
-            [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
             // Increment per-origin sequence and fetch previous hash.
             [$sequence, $prevHash] = $this->nextSequenceAndHash($db);
 

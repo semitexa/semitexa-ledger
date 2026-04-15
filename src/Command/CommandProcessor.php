@@ -122,7 +122,11 @@ final class CommandProcessor
             $envelope = json_decode($rawPayload, true, 512, JSON_THROW_ON_ERROR);
             $commandClass = $envelope['command_class'] ?? null;
 
-            if ($commandClass === null || !$this->commandRegistry->isRegistered($commandClass)) {
+            if ($commandClass === null) {
+                return CommandResult::error('Missing command_class');
+            }
+
+            if (!$this->commandRegistry->isRegistered($commandClass)) {
                 return CommandResult::error("Unknown command class: {$commandClass}");
             }
 
