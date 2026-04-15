@@ -37,10 +37,15 @@ final class NatsClient
 
         // Security: enable TLS with peer verification when CA file is configured (VULN-009)
         if ($config->tlsCaFile !== null) {
+            $tlsCaFile = $config->tlsCaFile;
+            if (!is_file($tlsCaFile) || !is_readable($tlsCaFile)) {
+                throw new \InvalidArgumentException("NATS TLS CA file is not readable: {$tlsCaFile}");
+            }
+
             /** @phpstan-ignore argument.type */
             $options['tls'] = [
                 'verify_peer' => true,
-                'cafile' => $config->tlsCaFile,
+                'cafile' => $tlsCaFile,
             ];
         }
 
