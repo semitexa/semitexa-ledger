@@ -101,13 +101,15 @@ final class LedgerConnection
 
     /**
      * Execute a callable inside an exclusive SQLite transaction.
+     * Returns the value returned by the callable.
      */
-    public function transaction(callable $fn): void
+    public function transaction(callable $fn): mixed
     {
         $this->db->exec('BEGIN EXCLUSIVE');
         try {
-            $fn($this);
+            $result = $fn($this);
             $this->db->exec('COMMIT');
+            return $result;
         } catch (\Throwable $e) {
             $this->db->exec('ROLLBACK');
             throw $e;

@@ -62,16 +62,16 @@ final class LedgerWriter
         $domain    = $propagated->domain ?? $this->deriveDomain($eventClass);
         $eventType = $this->deriveEventType($eventClass);
 
-        [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
-
         $now       = $this->nowMicros();
         $eventId   = UuidV7::generate();
         $metadata  = ['timestamp' => $now, 'node_id' => $this->nodeId];
 
         $ledgerEvent = $this->db->transaction(function (LedgerConnection $db) use (
-            $eventId, $domain, $eventType, $payload, $metadata,
-            $aggregateType, $aggregateId, $now
+            $event, $eventClass, $eventId, $domain, $eventType, $payload, $metadata, $now
         ): LedgerEvent {
+            // Ownership gate is checked inside the exclusive transaction to prevent
+            // TOCTOU races between concurrent Swoole workers (VULN-005).
+            [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
             // Increment per-origin sequence and fetch previous hash.
             [$sequence, $prevHash] = $this->nextSequenceAndHash($db);
 
@@ -79,7 +79,7 @@ final class LedgerWriter
             $hash = hash('sha256', $prevHash . $eventId . json_encode($payload, JSON_THROW_ON_ERROR));
             $hmac = hash_hmac('sha256', $hash, $this->hmacKey);
 
-            $event = new LedgerEvent(
+            $record = new LedgerEvent(
                 eventId:       $eventId,
                 originNode:    $this->nodeId,
                 sequence:      $sequence,
@@ -109,22 +109,22 @@ final class LedgerWriter
                   :aggregate_type, :aggregate_id, :payload, :metadata, :hash, :prev_hash, :hmac,
                   :source, :publish_status, :created_at)',
                 [
-                    'event_id'       => $event->eventId,
-                    'origin_node'    => $event->originNode,
-                    'sequence'       => $event->sequence,
-                    'domain'         => $event->domain,
-                    'event_type'     => $event->eventType,
-                    'event_version'  => $event->eventVersion,
-                    'aggregate_type' => $event->aggregateType,
-                    'aggregate_id'   => $event->aggregateId,
-                    'payload'        => json_encode($event->payload, JSON_THROW_ON_ERROR),
-                    'metadata'       => json_encode($event->metadata, JSON_THROW_ON_ERROR),
-                    'hash'           => $event->hash,
-                    'prev_hash'      => $event->prevHash,
-                    'hmac'           => $event->hmac,
-                    'source'         => $event->source,
-                    'publish_status' => $event->publishStatus,
-                    'created_at'     => $event->createdAt,
+                    'event_id'       => $record->eventId,
+                    'origin_node'    => $record->originNode,
+                    'sequence'       => $record->sequence,
+                    'domain'         => $record->domain,
+                    'event_type'     => $record->eventType,
+                    'event_version'  => $record->eventVersion,
+                    'aggregate_type' => $record->aggregateType,
+                    'aggregate_id'   => $record->aggregateId,
+                    'payload'        => json_encode($record->payload, JSON_THROW_ON_ERROR),
+                    'metadata'       => json_encode($record->metadata, JSON_THROW_ON_ERROR),
+                    'hash'           => $record->hash,
+                    'prev_hash'      => $record->prevHash,
+                    'hmac'           => $record->hmac,
+                    'source'         => $record->source,
+                    'publish_status' => $record->publishStatus,
+                    'created_at'     => $record->createdAt,
                 ]
             );
 
@@ -143,7 +143,7 @@ final class LedgerWriter
                 ]
             );
 
-            return $event;
+            return $record;
         });
 
         return $ledgerEvent;

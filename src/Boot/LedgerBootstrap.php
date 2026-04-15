@@ -13,6 +13,7 @@ use Semitexa\Core\Server\Lifecycle\ServerLifecycleListenerInterface;
 use Semitexa\Core\Server\Lifecycle\ServerLifecyclePhase;
 use Semitexa\Ledger\Command\CommandBus;
 use Semitexa\Ledger\Command\CommandProcessor;
+use Semitexa\Ledger\Command\CommandRegistry;
 use Semitexa\Ledger\Ledger\LedgerConnection;
 use Semitexa\Ledger\Ledger\LedgerPublisher;
 use Semitexa\Ledger\Ledger\LedgerReplayer;
@@ -143,7 +144,10 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
         $replayer->start();
 
         // 7. Start CommandProcessor subscription.
-        $processor = new CommandProcessor($nodeId, $clusters, $ownership);
+        $commandRegistry = new CommandRegistry(
+            $container->get(\Semitexa\Core\Discovery\ClassDiscovery::class),
+        );
+        $processor = new CommandProcessor($nodeId, $clusters, $ownership, $commandRegistry);
         $processor->startListeners();
 
         // 8. Register CommandBus in the container so application handlers can inject it.
