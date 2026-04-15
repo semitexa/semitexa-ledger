@@ -43,6 +43,7 @@ final class ClusterRegistry
             url:             (string) (getenv('NATS_PRIMARY_URL') ?: getenv('NATS_URL') ?: 'nats://localhost:4222'),
             credentialsPath: (getenv('NATS_PRIMARY_CREDENTIALS') ?: null) ?: null,
             priority:        0,
+            tlsCaFile:       (getenv('NATS_PRIMARY_TLS_CA') ?: null) ?: null,
         ));
 
         $secondaryUrl = getenv('NATS_SECONDARY_URL');
@@ -52,6 +53,7 @@ final class ClusterRegistry
                 url:             $secondaryUrl,
                 credentialsPath: (getenv('NATS_SECONDARY_CREDENTIALS') ?: null) ?: null,
                 priority:        1,
+                tlsCaFile:       (getenv('NATS_SECONDARY_TLS_CA') ?: null) ?: null,
             ));
         }
 
