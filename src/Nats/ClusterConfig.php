@@ -24,6 +24,12 @@ final readonly class ClusterConfig
          * ClusterRegistry::getOrderedByPriority() sorts ascending.
          */
         public int $priority = 0,
+
+        /**
+         * Optional TLS CA file path for encrypted NATS connections.
+         * When set, enables TLS with peer verification (VULN-009).
+         */
+        public ?string $tlsCaFile = null,
     ) {}
 
     public static function fromEnv(string $prefix = 'NATS'): self
@@ -36,6 +42,7 @@ final readonly class ClusterConfig
             url:             $url,
             credentialsPath: self::env("{$prefix}_CREDENTIALS") ?: null,
             priority:        (int) self::env("{$prefix}_PRIORITY", '0'),
+            tlsCaFile:       self::env("{$prefix}_TLS_CA") ?: null,
         );
     }
 

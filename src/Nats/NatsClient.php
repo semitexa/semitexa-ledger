@@ -35,6 +35,15 @@ final class NatsClient
             $options['nkey'] = $config->credentialsPath;
         }
 
+        // Security: enable TLS with peer verification when CA file is configured (VULN-009)
+        if ($config->tlsCaFile !== null) {
+            /** @phpstan-ignore argument.type */
+            $options['tls'] = [
+                'verify_peer' => true,
+                'cafile' => $config->tlsCaFile,
+            ];
+        }
+
         $this->client = new Client(new Configuration($options));
     }
 
