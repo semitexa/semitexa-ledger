@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Contract;
+namespace Semitexa\Ledger\Domain\Contract;
 
 use Semitexa\Ledger\Dto\LedgerEvent;
 

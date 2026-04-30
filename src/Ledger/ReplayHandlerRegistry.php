@@ -6,7 +6,7 @@ namespace Semitexa\Ledger\Ledger;
 
 use Semitexa\Core\Discovery\ClassDiscovery;
 use Semitexa\Ledger\Attribute\AsReplayHandler;
-use Semitexa\Ledger\Contract\ReplayHandlerInterface;
+use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
 use Semitexa\Ledger\Dto\LedgerEvent;
 
 /**

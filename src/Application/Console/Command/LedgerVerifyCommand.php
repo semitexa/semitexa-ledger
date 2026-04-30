@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Console;
+namespace Semitexa\Ledger\Application\Console\Command;
 
 use Semitexa\Core\Attribute\AsCommand;
 use Semitexa\Ledger\Ledger\LedgerConnection;
