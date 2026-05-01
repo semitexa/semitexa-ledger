@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Queue;
+namespace Semitexa\Ledger\Application\Service\Queue;
 
 use Semitexa\Core\Queue\QueueTransportFactoryInterface;
 use Semitexa\Core\Queue\QueueTransportInterface;
-use Semitexa\Ledger\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 
 final class NatsTransportFactory implements QueueTransportFactoryInterface
 {

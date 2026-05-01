@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ledger;
+namespace Semitexa\Ledger\Application\Service;
 
 /**
  * Creates and migrates the SQLite ledger schema.

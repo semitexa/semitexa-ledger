@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Queue;
+namespace Semitexa\Ledger\Application\Service\Queue;
 
 use Semitexa\Core\Queue\QueueTransportInterface;
-use Semitexa\Ledger\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 
 /**
  * NATS JetStream implementation of the existing QueueTransportInterface.
@@ -66,7 +66,7 @@ final class NatsTransport implements QueueTransportInterface
         }
     }
 
-    private function primaryClient(): \Semitexa\Ledger\Nats\NatsClient
+    private function primaryClient(): \Semitexa\Ledger\Application\Service\Nats\NatsClient
     {
         $clusters = $this->clusters->getOrderedByPriority();
         if ($clusters === []) {

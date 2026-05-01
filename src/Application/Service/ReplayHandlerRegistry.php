@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ledger;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Discovery\ClassDiscovery;
 use Semitexa\Ledger\Attribute\AsReplayHandler;
 use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
-use Semitexa\Ledger\Dto\LedgerEvent;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
 
 /**
  * Discovers and dispatches replay handlers for incoming remote events.

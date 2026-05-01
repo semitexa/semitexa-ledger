@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Boot;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Attribute\AsServerLifecycleListener;
 use Semitexa\Core\Container\ContainerFactory;
@@ -11,22 +11,22 @@ use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleContext;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleListenerInterface;
 use Semitexa\Core\Server\Lifecycle\ServerLifecyclePhase;
-use Semitexa\Ledger\Command\CommandBus;
-use Semitexa\Ledger\Command\CommandProcessor;
-use Semitexa\Ledger\Command\CommandRegistry;
-use Semitexa\Ledger\Ledger\LedgerConnection;
-use Semitexa\Ledger\Ledger\LedgerPublisher;
-use Semitexa\Ledger\Ledger\LedgerReplayer;
-use Semitexa\Ledger\Ledger\LedgerSchema;
-use Semitexa\Ledger\Ledger\LedgerWriter;
-use Semitexa\Ledger\Ledger\ReplayHandlerRegistry;
-use Semitexa\Ledger\Nats\ClusterHealthTracker;
-use Semitexa\Ledger\Nats\ClusterRegistry;
-use Semitexa\Ledger\Ownership\AggregateOwnershipService;
-use Semitexa\Ledger\Ownership\OwnershipCache;
-use Semitexa\Ledger\Queue\DualWriteTransport;
-use Semitexa\Ledger\Queue\NatsTransportFactory;
-use Semitexa\Orm\Connection\ConnectionRegistry;
+use Semitexa\Ledger\Application\Service\CommandBus;
+use Semitexa\Ledger\Application\Service\CommandProcessor;
+use Semitexa\Ledger\Application\Service\CommandRegistry;
+use Semitexa\Ledger\Application\Service\LedgerConnection;
+use Semitexa\Ledger\Application\Service\LedgerPublisher;
+use Semitexa\Ledger\Application\Service\LedgerReplayer;
+use Semitexa\Ledger\Application\Service\LedgerSchema;
+use Semitexa\Ledger\Application\Service\LedgerWriter;
+use Semitexa\Ledger\Application\Service\ReplayHandlerRegistry;
+use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
+use Semitexa\Ledger\Application\Service\OwnershipCache;
+use Semitexa\Ledger\Application\Service\Queue\DualWriteTransport;
+use Semitexa\Ledger\Application\Service\Queue\NatsTransportFactory;
+use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
 
 /**
  * Wires up the ledger on each Swoole worker startup:

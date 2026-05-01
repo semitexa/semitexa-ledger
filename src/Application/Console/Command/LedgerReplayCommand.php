@@ -6,8 +6,8 @@ namespace Semitexa\Ledger\Application\Console\Command;
 
 use Semitexa\Core\Attribute\AsCommand;
 use Semitexa\Core\Container\ContainerFactory;
-use Semitexa\Ledger\Ledger\LedgerConnection;
-use Semitexa\Ledger\Ledger\ReplayHandlerRegistry;
+use Semitexa\Ledger\Application\Service\LedgerConnection;
+use Semitexa\Ledger\Application\Service\ReplayHandlerRegistry;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -81,7 +81,7 @@ final class LedgerReplayCommand extends Command
         $container = ContainerFactory::get();
 
         foreach ($rows as $row) {
-            $event = \Semitexa\Ledger\Dto\LedgerEvent::fromRow($row);
+            $event = \Semitexa\Ledger\Domain\Model\LedgerEvent::fromRow($row);
 
             if ($dryRun) {
                 $io->writeln(sprintf(

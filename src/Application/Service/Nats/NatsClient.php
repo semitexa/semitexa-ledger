@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Nats;
+namespace Semitexa\Ledger\Application\Service\Nats;
+
+use Semitexa\Ledger\Domain\Model\ClusterConfig;
 
 use Basis\Nats\Client;
 use Basis\Nats\Configuration;

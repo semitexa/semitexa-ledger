@@ -2,16 +2,16 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ledger;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Support\PayloadSerializer;
 use Semitexa\Ledger\Attribute\OwnedAggregate;
 use Semitexa\Ledger\Attribute\Propagated;
-use Semitexa\Ledger\Dto\LedgerEvent;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Exception\AggregateNotFoundException;
 use Semitexa\Ledger\Exception\OwnershipViolationException;
-use Semitexa\Ledger\Ownership\AggregateOwnershipService;
-use Semitexa\Ledger\Support\UuidV7;
+use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
+use Semitexa\Ledger\Application\Service\UuidV7;
 
 /**
  * Appends domain events to the local SQLite ledger.

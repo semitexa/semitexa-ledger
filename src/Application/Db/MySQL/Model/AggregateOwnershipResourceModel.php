@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ownership\Model;
+namespace Semitexa\Ledger\Application\Db\MySQL\Model;
 
 use Semitexa\Orm\Adapter\MySqlType;
 use Semitexa\Orm\Attribute\Column;

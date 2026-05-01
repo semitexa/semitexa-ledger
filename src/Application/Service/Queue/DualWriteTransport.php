@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Queue;
+namespace Semitexa\Ledger\Application\Service\Queue;
 
 use Semitexa\Core\Queue\QueueTransportInterface;
 

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Command;
+namespace Semitexa\Ledger\Domain\Model;
 
 /**
  * Result returned by CommandBus::sendAndWait() after the owner node

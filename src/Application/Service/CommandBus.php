@@ -2,15 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Command;
+namespace Semitexa\Ledger\Application\Service;
+
+use Semitexa\Ledger\Domain\Model\CommandResult;
 
 use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Core\Support\PayloadSerializer;
 use Semitexa\Ledger\Attribute\AsAggregateCommand;
 use Semitexa\Ledger\Exception\AggregateNotFoundException;
 use Semitexa\Ledger\Exception\OwnerNodeUnavailableException;
-use Semitexa\Ledger\Nats\ClusterRegistry;
-use Semitexa\Ledger\Ownership\AggregateOwnershipService;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 
 /**
  * Routes aggregate mutation commands to the owning node.
@@ -125,7 +127,7 @@ final class CommandBus
         return $owner;
     }
 
-    private function primaryClient(): ?\Semitexa\Ledger\Nats\NatsClient
+    private function primaryClient(): ?\Semitexa\Ledger\Application\Service\Nats\NatsClient
     {
         $clusters = $this->clusters->getOrderedByPriority();
         return $clusters !== [] ? $clusters[0]['client'] : null;

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Nats;
+namespace Semitexa\Ledger\Application\Service\Nats;
 
 /**
  * Tracks publish success/failure per cluster.

@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ledger;
+namespace Semitexa\Ledger\Application\Service;
 
-use Semitexa\Ledger\Dto\LedgerEvent;
-use Semitexa\Ledger\Nats\ClusterHealthTracker;
-use Semitexa\Ledger\Nats\ClusterRegistry;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
+use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 
 /**
  * Background Swoole coroutine that publishes pending local events to NATS.

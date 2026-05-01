@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ledger;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Container\ContainerFactory;
-use Semitexa\Ledger\Dto\LedgerEvent;
-use Semitexa\Ledger\Nats\ClusterRegistry;
-use Semitexa\Ledger\Ownership\AggregateOwnershipService;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 
 /**
  * Background Swoole coroutine that consumes events from NATS and applies them
@@ -69,7 +69,7 @@ final class LedgerReplayer
      * Single-cluster consume loop. Runs indefinitely.
      */
     private function runConsumeLoop(
-        \Semitexa\Ledger\Nats\NatsClient $client,
+        \Semitexa\Ledger\Application\Service\Nats\NatsClient $client,
         string $consumerName,
         string $clusterId,
     ): void {

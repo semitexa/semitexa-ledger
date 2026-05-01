@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Nats;
+namespace Semitexa\Ledger\Domain\Model;
 
 /**
  * Immutable configuration for one JetStream cluster (primary or secondary).

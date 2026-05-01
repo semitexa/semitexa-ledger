@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Support;
+namespace Semitexa\Ledger\Application\Service;
 
 /**
  * Generates UUID version 7 (time-ordered, random).

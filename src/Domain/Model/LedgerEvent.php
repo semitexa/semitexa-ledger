@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Dto;
+namespace Semitexa\Ledger\Domain\Model;
 
 /**
  * Immutable value object representing one entry in the event ledger.

@@ -2,12 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Command;
+namespace Semitexa\Ledger\Application\Service;
+
+use Semitexa\Ledger\Domain\Model\CommandResult;
 
 use Semitexa\Core\Container\ContainerFactory;
-use Semitexa\Ledger\Nats\ClusterRegistry;
-use Semitexa\Ledger\Nats\NatsClient;
-use Semitexa\Ledger\Ownership\AggregateOwnershipService;
+use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\NatsClient;
+use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 
 /**
  * Handles incoming aggregate commands on the owner node.

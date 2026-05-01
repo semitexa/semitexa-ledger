@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Command;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Discovery\ClassDiscovery;
 use Semitexa\Ledger\Attribute\AsAggregateCommand;

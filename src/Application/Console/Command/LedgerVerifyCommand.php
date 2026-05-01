@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Console\Command;
 
 use Semitexa\Core\Attribute\AsCommand;
-use Semitexa\Ledger\Ledger\LedgerConnection;
+use Semitexa\Ledger\Application\Service\LedgerConnection;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;

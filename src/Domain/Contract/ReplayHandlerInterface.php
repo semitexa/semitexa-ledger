@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Domain\Contract;
 
-use Semitexa\Ledger\Dto\LedgerEvent;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
 
 /**
  * Applies a remote event to the local main database.

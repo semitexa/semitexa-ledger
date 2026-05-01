@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Semitexa\Ledger\Ownership;
+namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 
