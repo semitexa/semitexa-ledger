@@ -76,7 +76,7 @@ Register an idempotent replay handler for events that must update the local main
 
 ```php
 use Semitexa\Ledger\Attribute\AsReplayHandler;
-use Semitexa\Ledger\Contract\ReplayHandlerInterface;
+use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
 use Semitexa\Ledger\Dto\LedgerEvent;
 
 #[AsReplayHandler(domain: 'inventory', eventType: 'stock_adjusted')]
