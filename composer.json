@@ -37,6 +37,5 @@
         "jetstream",
         "event-sourcing",
         "sqlite"
-    ],
-    "version": "v0.0.1"
+    ]
 }
