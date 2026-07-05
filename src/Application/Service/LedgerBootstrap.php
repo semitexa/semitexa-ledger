@@ -55,14 +55,39 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
     phase: ServerLifecyclePhase::WorkerStartAfterContainer->value,
     priority: 100,
 )]
-final class LedgerBootstrap implements ServerLifecycleListenerInterface
+class LedgerBootstrap implements ServerLifecycleListenerInterface
 {
+    /**
+     * Per-worker guard. The WorkerStartAfterContainer phase can re-run (the OS
+     * listeners carry the same guard for exactly this reason), and the ledger
+     * must boot ONCE per worker: a second run would add a duplicate post-dispatch
+     * hook to the long-lived EventDispatcher — every ledger event then appended
+     * twice and the hook list growing unbounded — and spawn a second set of
+     * background Publisher/Replayer/CommandProcessor coroutines.
+     */
+    private static bool $booted = false;
+
     public function handle(ServerLifecycleContext $context): void
     {
         if (!$this->shouldBootLedger()) {
             return;
         }
+        if (self::$booted) {
+            return;
+        }
+        self::$booted = true;
 
+        $this->boot($context);
+    }
+
+    /** Reset the boot guard (worker-stop / test hygiene). */
+    public static function reset(): void
+    {
+        self::$booted = false;
+    }
+
+    protected function boot(ServerLifecycleContext $context): void
+    {
         $nodeId  = $this->requireEnv('LEDGER_NODE_ID');
         $hmacKey = $this->requireEnv('LEDGER_HMAC_KEY');
         $dbPath  = (string) (getenv('LEDGER_DB_PATH') ?: "/var/lib/semitexa/ledger/{$nodeId}.sqlite");
