@@ -36,6 +36,21 @@ final class OwnershipCache
         }
 
         $value = $loader();
+
+        // $loader yields on its DB read, so a concurrent writer (an
+        // INSERT-IGNORE claimOwnership that then cache->set(nodeId)) may have
+        // cached a FRESHER owner while we were suspended. Do not clobber it
+        // with our now-stale result: a resolveOwner() that loaded null just
+        // before a concurrent claim would otherwise overwrite the real owner
+        // with null and cache it for the whole TTL (aggregate reads as
+        // unowned for ~60s despite the DB row existing). Defer to the fresher
+        // write. The re-check + set below run without yielding, so no writer
+        // can interleave between them.
+        $current = $this->entries[$cacheKey] ?? null;
+        if ($current !== null && $current['expires'] > microtime(true)) {
+            return $current['owner'];
+        }
+
         $this->set($cacheKey, $value);
 
         return $value;
