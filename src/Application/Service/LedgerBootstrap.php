@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Attribute\AsServerLifecycleListener;
-use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Core\Event\EventDispatcher;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleContext;
@@ -88,6 +87,14 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
 
     protected function boot(ServerLifecycleContext $context): void
     {
+        // The container arrives via the lifecycle context (populated for
+        // post-container phases) — the DI-compliant path, so this composition
+        // root no longer reaches for the static ContainerFactory. Fail fast if
+        // it is absent before touching any infrastructure.
+        $container = $context->container ?? throw new \RuntimeException(
+            'LedgerBootstrap requires the application container on the WorkerStartAfterContainer lifecycle context.',
+        );
+
         $nodeId  = $this->requireEnv('LEDGER_NODE_ID');
         $hmacKey = $this->requireEnv('LEDGER_HMAC_KEY');
         $dbPath  = (string) (getenv('LEDGER_DB_PATH') ?: "/var/lib/semitexa/ledger/{$nodeId}.sqlite");
@@ -128,7 +135,6 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         }
 
         // Shared services.
-        $container      = ContainerFactory::get();
         $ownershipCache = new OwnershipCache();
 
         // Resolve the ORM database adapter for the aggregate_ownership table.

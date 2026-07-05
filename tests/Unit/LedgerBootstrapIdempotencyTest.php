@@ -69,11 +69,31 @@ final class LedgerBootstrapIdempotencyTest extends TestCase
         self::assertSame(0, $bootstrap->bootCount);
     }
 
-    private function context(): ServerLifecycleContext
+    #[Test]
+    public function the_real_boot_fails_fast_when_the_context_has_no_container(): void
     {
-        // boot() is overridden to ignore the context, and the guard never reads
-        // it — so we don't need to stand up a real Swoole\Http\Server.
-        return (new \ReflectionClass(ServerLifecycleContext::class))->newInstanceWithoutConstructor();
+        // The composition root now reads the container from the lifecycle context
+        // instead of the static ContainerFactory; a post-container phase always
+        // carries it, but if it is somehow absent boot() must fail fast (before
+        // touching any SQLite/NATS infrastructure) rather than run half-wired.
+        putenv('LEDGER_ENABLED=1');
+        $bootstrap = new LedgerBootstrap();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('requires the application container');
+        $bootstrap->handle($this->context(container: null));
+    }
+
+    private function context(?object $container = null): ServerLifecycleContext
+    {
+        // boot() is overridden in the guard tests to ignore the context; for the
+        // real-boot test we set `container` explicitly. Building via reflection
+        // avoids standing up a real Swoole\Http\Server.
+        $ctx = (new \ReflectionClass(ServerLifecycleContext::class))->newInstanceWithoutConstructor();
+        $prop = new \ReflectionProperty(ServerLifecycleContext::class, 'container');
+        $prop->setValue($ctx, $container);
+
+        return $ctx;
     }
 }
 
