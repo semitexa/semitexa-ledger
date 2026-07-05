@@ -127,13 +127,7 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
 
         /** @var EventDispatcher $dispatcher */
         $dispatcher = $container->get(EventDispatcher::class);
-        $dispatcher->addPostDispatchHook(function (object $event) use ($writer): void {
-            try {
-                $writer->append($event);
-            } catch (\Throwable $e) {
-                error_log('[semitexa-ledger] LedgerWriter::append failed: ' . $e->getMessage());
-            }
-        });
+        $dispatcher->addPostDispatchHook(new LedgerDispatchHook($writer->append(...)));
 
         // 5. Start LedgerPublisher background coroutine.
         $publisher = new LedgerPublisher($db, $nodeId, $clusters, $health);
