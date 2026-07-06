@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Core\Attribute\AsServerLifecycleListener;
-use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Core\Event\EventDispatcher;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleContext;
@@ -55,13 +54,46 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
     phase: ServerLifecyclePhase::WorkerStartAfterContainer->value,
     priority: 100,
 )]
-final class LedgerBootstrap implements ServerLifecycleListenerInterface
+class LedgerBootstrap implements ServerLifecycleListenerInterface
 {
+    /**
+     * Per-worker guard. The WorkerStartAfterContainer phase can re-run (the OS
+     * listeners carry the same guard for exactly this reason), and the ledger
+     * must boot ONCE per worker: a second run would add a duplicate post-dispatch
+     * hook to the long-lived EventDispatcher — every ledger event then appended
+     * twice and the hook list growing unbounded — and spawn a second set of
+     * background Publisher/Replayer/CommandProcessor coroutines.
+     */
+    private static bool $booted = false;
+
     public function handle(ServerLifecycleContext $context): void
     {
         if (!$this->shouldBootLedger()) {
             return;
         }
+        if (self::$booted) {
+            return;
+        }
+        self::$booted = true;
+
+        $this->boot($context);
+    }
+
+    /** Reset the boot guard (worker-stop / test hygiene). */
+    public static function reset(): void
+    {
+        self::$booted = false;
+    }
+
+    protected function boot(ServerLifecycleContext $context): void
+    {
+        // The container arrives via the lifecycle context (populated for
+        // post-container phases) — the DI-compliant path, so this composition
+        // root no longer reaches for the static ContainerFactory. Fail fast if
+        // it is absent before touching any infrastructure.
+        $container = $context->container ?? throw new \RuntimeException(
+            'LedgerBootstrap requires the application container on the WorkerStartAfterContainer lifecycle context.',
+        );
 
         $nodeId  = $this->requireEnv('LEDGER_NODE_ID');
         $hmacKey = $this->requireEnv('LEDGER_HMAC_KEY');
@@ -103,7 +135,6 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
         }
 
         // Shared services.
-        $container      = ContainerFactory::get();
         $ownershipCache = new OwnershipCache();
 
         // Resolve the ORM database adapter for the aggregate_ownership table.
@@ -127,13 +158,7 @@ final class LedgerBootstrap implements ServerLifecycleListenerInterface
 
         /** @var EventDispatcher $dispatcher */
         $dispatcher = $container->get(EventDispatcher::class);
-        $dispatcher->addPostDispatchHook(function (object $event) use ($writer): void {
-            try {
-                $writer->append($event);
-            } catch (\Throwable $e) {
-                error_log('[semitexa-ledger] LedgerWriter::append failed: ' . $e->getMessage());
-            }
-        });
+        $dispatcher->addPostDispatchHook(new LedgerDispatchHook($writer->append(...)));
 
         // 5. Start LedgerPublisher background coroutine.
         $publisher = new LedgerPublisher($db, $nodeId, $clusters, $health);

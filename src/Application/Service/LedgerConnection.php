@@ -9,12 +9,27 @@ use Semitexa\Ledger\Domain\Model\LedgerEvent;
 /**
  * Thin SQLite3 wrapper with WAL mode, optimized pragmas, and typed query helpers.
  *
- * One instance per worker process. Swoole's SWOOLE_HOOK_ALL makes SQLite3
- * I/O non-blocking inside coroutines — no additional handling required.
+ * One instance per worker process. Swoole's SWOOLE_HOOK_ALL makes SQLite3 I/O
+ * non-blocking inside coroutines — which is exactly why {@see transaction()}
+ * needs an intra-worker mutex: a yielding statement inside one coroutine's
+ * `BEGIN EXCLUSIVE` transaction would otherwise let another coroutine open a
+ * SECOND transaction on the SAME shared connection ("cannot start a
+ * transaction within a transaction", or interleaved SELECT/INSERT that shares
+ * a sequence number / breaks the prev-hash chain). BEGIN EXCLUSIVE only
+ * serialises writers across PROCESSES; the mutex serialises coroutines WITHIN
+ * a worker.
  */
 final class LedgerConnection
 {
     private \SQLite3 $db;
+
+    /**
+     * Intra-worker transaction mutex: a capacity-1 coroutine Channel used as a
+     * one-token lock. Created lazily inside a coroutine (Channel methods are
+     * illegal outside one), so it is null on the CLI/single-threaded path where
+     * no coroutine concurrency exists and no serialisation is needed.
+     */
+    private ?\Swoole\Coroutine\Channel $txMutex = null;
 
     public function __construct(string $dbPath)
     {
@@ -102,18 +117,55 @@ final class LedgerConnection
     /**
      * Execute a callable inside an exclusive SQLite transaction.
      * Returns the value returned by the callable.
+     *
+     * Serialised per worker: the callable's statements yield under
+     * SWOOLE_HOOK_ALL, so without the mutex a concurrent coroutine could open a
+     * second BEGIN EXCLUSIVE on the shared connection mid-transaction. The mutex
+     * holds one coroutine's whole BEGIN..COMMIT before the next starts.
      */
     public function transaction(callable $fn): mixed
     {
-        $this->db->exec('BEGIN EXCLUSIVE');
+        $mutex = $this->acquireTxMutex();
         try {
-            $result = $fn($this);
-            $this->db->exec('COMMIT');
-            return $result;
-        } catch (\Throwable $e) {
-            $this->db->exec('ROLLBACK');
-            throw $e;
+            $this->db->exec('BEGIN EXCLUSIVE');
+            try {
+                $result = $fn($this);
+                $this->db->exec('COMMIT');
+                return $result;
+            } catch (\Throwable $e) {
+                $this->db->exec('ROLLBACK');
+                throw $e;
+            }
+        } finally {
+            $mutex?->push(true);
         }
+    }
+
+    /**
+     * Acquire the intra-worker transaction lock, returning the Channel to
+     * release on (or null when not in a coroutine — the CLI path, where no
+     * concurrent coroutine can interleave). Lazy-created inside the coroutine:
+     * `new Channel(1)` + the seeding `push` do not yield, so two coroutines
+     * cannot both initialise it, and the loser blocks on `pop()` until the
+     * holder pushes back.
+     */
+    private function acquireTxMutex(): ?\Swoole\Coroutine\Channel
+    {
+        if (!self::inCoroutine()) {
+            return null;
+        }
+        if ($this->txMutex === null) {
+            $this->txMutex = new \Swoole\Coroutine\Channel(1);
+            $this->txMutex->push(true);
+        }
+        $this->txMutex->pop();
+
+        return $this->txMutex;
+    }
+
+    private static function inCoroutine(): bool
+    {
+        return class_exists(\Swoole\Coroutine::class, false) && \Swoole\Coroutine::getCid() > 0;
     }
 
     public function lastInsertRowId(): int
