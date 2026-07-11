@@ -56,8 +56,11 @@ final class NatsTransport implements QueueTransportInterface
             );
 
             foreach ($messages as $msg) {
+                // Consumer::handle() already acked on receipt (its $ack
+                // default) — and $msg here is a bare Payload, which has no
+                // ack() at all; calling it killed the worker on the first
+                // delivered batch.
                 $callback((string) $msg->body);
-                $msg->ack();
             }
 
             if (empty($messages)) {
