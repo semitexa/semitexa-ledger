@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Console\Command;
 
+use Semitexa\Core\Attribute\InjectAsReadonly;
+use Semitexa\Core\Container\SemitexaContainer;
 use Semitexa\Core\Attribute\AsCommand;
-use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Ledger\Application\Service\LedgerConnection;
 use Semitexa\Ledger\Application\Service\ReplayHandlerRegistry;
 use Symfony\Component\Console\Command\Command;
@@ -41,6 +42,15 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 )]
 final class LedgerReplayCommand extends Command
 {
+    /**
+     * The concrete container, not PSR-11: replay resolves handler classes named
+     * by the recorded events, and resolve() — construct-and-inject an arbitrary
+     * class — has no PSR-11 equivalent. Injected rather than reached for
+     * statically; the resolution itself stays lazy, inside the command body.
+     */
+    #[InjectAsReadonly]
+    protected SemitexaContainer $container;
+
     protected function configure(): void
     {
         $this->addOption('since',      null, InputOption::VALUE_OPTIONAL, 'Replay from this ISO 8601 timestamp');
@@ -64,7 +74,7 @@ final class LedgerReplayCommand extends Command
         $dbPath  = (string) (getenv('LEDGER_DB_PATH') ?: "/var/lib/semitexa/ledger/{$nodeId}.sqlite");
 
         $db       = new LedgerConnection($dbPath);
-        $registry = ContainerFactory::get()->resolve(ReplayHandlerRegistry::class);
+        $registry = $this->container->resolve(ReplayHandlerRegistry::class);
 
         [$sql, $params] = $this->buildQuery($since, $domain, $evtType, $origin);
 
@@ -78,7 +88,7 @@ final class LedgerReplayCommand extends Command
         $io->note(sprintf('Found %d event(s) to replay.%s', count($rows), $dryRun ? ' (dry-run)' : ''));
 
         $applied = 0;
-        $container = ContainerFactory::get();
+        $container = $this->container;
 
         foreach ($rows as $row) {
             $event = \Semitexa\Ledger\Domain\Model\LedgerEvent::fromRow($row);
