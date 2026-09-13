@@ -12,7 +12,7 @@
     "require": {
         "php": "^8.4",
         "ext-sqlite3": "*",
-        "semitexa/core": ">=2026.09.13.0749",
+        "semitexa/core": ">=2026.09.13.0749 || dev-master",
         "basis-company/nats": "^1.1"
     },
     "autoload": {
