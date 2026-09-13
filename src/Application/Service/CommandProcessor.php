@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\CommandResult;
 
 use Semitexa\Core\Container\ContainerFactory;
@@ -107,8 +108,17 @@ final class CommandProcessor
 
         // Process incoming messages in a loop.
         \Swoole\Coroutine::create(function () use ($client): void {
+            StandingCoroutines::declare(
+                'ledger command processor',
+                'waiting on NATS for a ledger command — by design, never returns',
+            );
+
             while (true) {
                 try {
+                    // No StandingCoroutines::busy() here, unlike the publisher
+                    // and the replayer: process() both waits for a command and
+                    // dispatches it, with no seam between the two, so there is
+                    // no point at which the label could truthfully come down.
                     $client->process(1.0);
                 } catch (\Throwable $e) {
                     error_log('[semitexa-ledger] CommandProcessor error: ' . $e->getMessage());

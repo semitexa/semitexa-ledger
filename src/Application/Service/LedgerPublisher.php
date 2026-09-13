@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
@@ -45,9 +46,17 @@ final class LedgerPublisher
      */
     public function runRetryLoop(): void
     {
+        StandingCoroutines::declare(
+            'ledger retry publisher',
+            'draining unpublished ledger entries — sleeps between batches, by design',
+        );
+
         while (true) {
             try {
-                $published = $this->publishBatch();
+                // The label describes the SLEEP between batches. A batch that
+                // wedges on a slow cluster is work, not a park, and must not be
+                // reported as standing by design. Raised in review of core#135.
+                $published = StandingCoroutines::busy(fn (): int => $this->publishBatch());
             } catch (\Throwable $e) {
                 error_log('[semitexa-ledger] LedgerPublisher error: ' . $e->getMessage());
                 $published = 0;

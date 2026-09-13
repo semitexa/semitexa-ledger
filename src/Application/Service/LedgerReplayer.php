@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
@@ -73,6 +74,11 @@ final class LedgerReplayer
         string $consumerName,
         string $clusterId,
     ): void {
+        StandingCoroutines::declare(
+            'ledger replayer',
+            'pulling from cluster ' . $clusterId . ' — parks between pulls, by design',
+        );
+
         while (true) {
             try {
                 $messages = $client->pullMessages(
@@ -81,9 +87,15 @@ final class LedgerReplayer
                     batchSize:    self::PULL_BATCH,
                 );
 
-                foreach ($messages as $msg) {
-                    $this->processMessage((string) $msg->body, $clusterId, $consumerName, $msg);
-                }
+                // The pull above is the park the label describes; handling
+                // what it returned is not, and a message that wedges the
+                // replayer must not read as standing by design. Raised in
+                // review of core#135.
+                StandingCoroutines::busy(function () use ($messages, $clusterId, $consumerName): void {
+                    foreach ($messages as $msg) {
+                        $this->processMessage((string) $msg->body, $clusterId, $consumerName, $msg);
+                    }
+                });
 
                 if (empty($messages)) {
                     \Swoole\Coroutine::sleep(self::PULL_SLEEP);
