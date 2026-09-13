@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
@@ -45,6 +46,11 @@ final class LedgerPublisher
      */
     public function runRetryLoop(): void
     {
+        StandingCoroutines::declare(
+            'ledger retry publisher',
+            'draining unpublished ledger entries — sleeps between batches, by design',
+        );
+
         while (true) {
             try {
                 $published = $this->publishBatch();

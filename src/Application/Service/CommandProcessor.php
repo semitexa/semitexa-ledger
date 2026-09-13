@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\CommandResult;
 
 use Semitexa\Core\Container\ContainerFactory;
@@ -107,6 +108,11 @@ final class CommandProcessor
 
         // Process incoming messages in a loop.
         \Swoole\Coroutine::create(function () use ($client): void {
+            StandingCoroutines::declare(
+                'ledger command processor',
+                'waiting on NATS for a ledger command — by design, never returns',
+            );
+
             while (true) {
                 try {
                     $client->process(1.0);

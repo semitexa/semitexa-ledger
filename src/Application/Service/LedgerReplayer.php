@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
@@ -73,6 +74,11 @@ final class LedgerReplayer
         string $consumerName,
         string $clusterId,
     ): void {
+        StandingCoroutines::declare(
+            'ledger replayer',
+            'pulling from cluster ' . $clusterId . ' — parks between pulls, by design',
+        );
+
         while (true) {
             try {
                 $messages = $client->pullMessages(
