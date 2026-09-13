@@ -53,7 +53,10 @@ final class LedgerPublisher
 
         while (true) {
             try {
-                $published = $this->publishBatch();
+                // The label describes the SLEEP between batches. A batch that
+                // wedges on a slow cluster is work, not a park, and must not be
+                // reported as standing by design. Raised in review of core#135.
+                $published = StandingCoroutines::busy(fn (): int => $this->publishBatch());
             } catch (\Throwable $e) {
                 error_log('[semitexa-ledger] LedgerPublisher error: ' . $e->getMessage());
                 $published = 0;

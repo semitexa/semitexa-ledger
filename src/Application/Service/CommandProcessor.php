@@ -115,6 +115,10 @@ final class CommandProcessor
 
             while (true) {
                 try {
+                    // No StandingCoroutines::busy() here, unlike the publisher
+                    // and the replayer: process() both waits for a command and
+                    // dispatches it, with no seam between the two, so there is
+                    // no point at which the label could truthfully come down.
                     $client->process(1.0);
                 } catch (\Throwable $e) {
                     error_log('[semitexa-ledger] CommandProcessor error: ' . $e->getMessage());

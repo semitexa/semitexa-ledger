@@ -87,9 +87,15 @@ final class LedgerReplayer
                     batchSize:    self::PULL_BATCH,
                 );
 
-                foreach ($messages as $msg) {
-                    $this->processMessage((string) $msg->body, $clusterId, $consumerName, $msg);
-                }
+                // The pull above is the park the label describes; handling
+                // what it returned is not, and a message that wedges the
+                // replayer must not read as standing by design. Raised in
+                // review of core#135.
+                StandingCoroutines::busy(function () use ($messages, $clusterId, $consumerName): void {
+                    foreach ($messages as $msg) {
+                        $this->processMessage((string) $msg->body, $clusterId, $consumerName, $msg);
+                    }
+                });
 
                 if (empty($messages)) {
                     \Swoole\Coroutine::sleep(self::PULL_SLEEP);
