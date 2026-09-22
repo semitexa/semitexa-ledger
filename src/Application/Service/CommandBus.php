@@ -6,7 +6,6 @@ namespace Semitexa\Ledger\Application\Service;
 
 use Semitexa\Ledger\Domain\Model\CommandResult;
 
-use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Core\Support\PayloadSerializer;
 use Semitexa\Ledger\Attribute\AsAggregateCommand;
 use Semitexa\Ledger\Exception\AggregateNotFoundException;

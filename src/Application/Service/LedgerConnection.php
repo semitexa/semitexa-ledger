@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
-use Semitexa\Ledger\Domain\Model\LedgerEvent;
-
 /**
  * Thin SQLite3 wrapper with WAL mode, optimized pragmas, and typed query helpers.
  *
