@@ -15,7 +15,7 @@ final class ClusterHealthTracker
     private const UNHEALTHY_THRESHOLD = 3;
     private const RECHECK_INTERVAL_SECONDS = 30.0;
 
-    /** @var array<string, array{failures: int, last_success: float}> */
+    /** @var array<string, array{failures: int, last_success: float, opened_at: ?float}> */
     private array $state = [];
 
     public function recordSuccess(string $clusterId): void
@@ -23,16 +23,27 @@ final class ClusterHealthTracker
         $this->state[$clusterId] = [
             'failures'     => 0,
             'last_success' => microtime(true),
+            'opened_at'    => null,
         ];
     }
 
     public function recordFailure(string $clusterId): void
     {
         if (!isset($this->state[$clusterId])) {
-            $this->state[$clusterId] = ['failures' => 0, 'last_success' => 0.0];
+            $this->state[$clusterId] = ['failures' => 0, 'last_success' => 0.0, 'opened_at' => null];
         }
 
         $this->state[$clusterId]['failures']++;
+
+        // The cooldown must be measured from the moment the breaker TRIPPED
+        // (the failure that reached the threshold), not from 'last_success'.
+        // A cluster that has never once succeeded defaults last_success to
+        // 0.0, so anchoring the cooldown there made isHealthy() compute an
+        // elapsed time of "now minus the Unix epoch" — always >= 30s — and the
+        // breaker never actually opened for a cluster with no prior success.
+        if ($this->state[$clusterId]['failures'] === self::UNHEALTHY_THRESHOLD) {
+            $this->state[$clusterId]['opened_at'] = microtime(true);
+        }
     }
 
     /**
@@ -53,8 +64,10 @@ final class ClusterHealthTracker
             return true;
         }
 
-        // Re-probe after the recheck interval.
-        $elapsed = microtime(true) - $s['last_success'];
+        // Re-probe after the recheck interval, counted from when the breaker
+        // opened (see recordFailure()), not from the (possibly never-set)
+        // last success.
+        $elapsed = microtime(true) - ($s['opened_at'] ?? microtime(true));
         return $elapsed >= self::RECHECK_INTERVAL_SECONDS;
     }
 
