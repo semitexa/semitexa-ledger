@@ -93,14 +93,38 @@ final class NatsClient
     public function request(string $subject, string $payload, float $timeoutSeconds = 5.0): string
     {
         $response = null;
+
+        // Basis\Nats\Client::request() waits via process($this->configuration->timeout) —
+        // a single blocking read bounded by the CONFIGURATION timeout, not by the stream
+        // timeout that setTimeout()/Connection::setTimeout() adjusts. That stream timeout
+        // only governs how long a single fread() blocks; the actual wait budget for
+        // request()'s reply loop comes straight from $client->configuration->timeout,
+        // which is fixed to 1.0s at construction (Configuration::$timeout). Without also
+        // overriding it here, a caller-specified $timeoutSeconds (e.g. 5.0) is silently
+        // capped at ~1s and the RuntimeException below lies about how long it waited.
+        //
+        // setTimeout() lazily opens the connection (Connection::init()), which can
+        // throw. The configuration change is therefore made inside the protected
+        // region so a failed setup still restores it — otherwise a later connect
+        // attempt would run with this request's timeout. The stream timeout is only
+        // restored when setup succeeded: restoring it would re-enter init().
         $previousTimeout = $this->client->configuration->timeout;
-        $this->client->setTimeout($timeoutSeconds);
+        $timeoutConfigured = false;
 
-        $this->client->request($subject, $payload, function (string $body) use (&$response): void {
-            $response = $body;
-        });
+        try {
+            $this->client->configuration->timeout = $timeoutSeconds;
+            $this->client->setTimeout($timeoutSeconds);
+            $timeoutConfigured = true;
 
-        $this->client->setTimeout($previousTimeout);
+            $this->client->request($subject, $payload, function (string $body) use (&$response): void {
+                $response = $body;
+            });
+        } finally {
+            $this->client->configuration->timeout = $previousTimeout;
+            if ($timeoutConfigured) {
+                $this->client->setTimeout($previousTimeout);
+            }
+        }
 
         if ($response === null) {
             throw new \RuntimeException("NATS request to '{$subject}' timed out after {$timeoutSeconds}s");
