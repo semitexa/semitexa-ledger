@@ -63,7 +63,10 @@ final class ClusterHealthTrackerCircuitBreakerTest extends TestCase
         // Guards against a regression that would anchor the cooldown on
         // opened_at unconditionally in a way that breaks the previously
         // correct "recovered" path once a success interleaves with failures.
-        $tracker = new ClusterHealthTracker();
+        $now = 1_000.0;
+        $tracker = new ClusterHealthTracker(static function () use (&$now): float {
+            return $now;
+        });
 
         $tracker->recordSuccess('recovering');
         $tracker->recordFailure('recovering');
@@ -71,5 +74,61 @@ final class ClusterHealthTrackerCircuitBreakerTest extends TestCase
         $tracker->recordFailure('recovering');
 
         self::assertFalse($tracker->isHealthy('recovering'));
+
+        $now += 29.0;
+        self::assertFalse($tracker->isHealthy('recovering'), 'still inside the 30s cooldown');
+
+        $now += 1.0;
+        self::assertTrue($tracker->isHealthy('recovering'), 'the cooldown elapsed: the cluster is re-probed');
+    }
+
+    #[Test]
+    public function a_failed_re_probe_starts_a_new_cooldown(): void
+    {
+        $now = 1_000.0;
+        $tracker = new ClusterHealthTracker(static function () use (&$now): float {
+            return $now;
+        });
+
+        $tracker->recordFailure('down');
+        $tracker->recordFailure('down');
+        $tracker->recordFailure('down');
+
+        $now += 30.0;
+        self::assertTrue($tracker->isHealthy('down'), 're-probe permitted');
+
+        // The re-probe fails: the breaker must close the door for another
+        // full cooldown instead of letting every later attempt through.
+        $tracker->recordFailure('down');
+        self::assertFalse($tracker->isHealthy('down'));
+
+        $now += 29.0;
+        self::assertFalse($tracker->isHealthy('down'));
+
+        $now += 1.0;
+        self::assertTrue($tracker->isHealthy('down'));
+    }
+
+    #[Test]
+    public function a_failure_recorded_while_the_breaker_is_open_does_not_extend_the_cooldown(): void
+    {
+        $now = 1_000.0;
+        $tracker = new ClusterHealthTracker(static function () use (&$now): float {
+            return $now;
+        });
+
+        $tracker->recordFailure('busy');
+        $tracker->recordFailure('busy');
+        $tracker->recordFailure('busy');
+
+        // An attempt that was already in flight when the breaker opened.
+        $now += 10.0;
+        $tracker->recordFailure('busy');
+
+        $now += 20.0;
+        self::assertTrue(
+            $tracker->isHealthy('busy'),
+            'the cooldown is counted from when the breaker opened, not from the in-flight failure',
+        );
     }
 }

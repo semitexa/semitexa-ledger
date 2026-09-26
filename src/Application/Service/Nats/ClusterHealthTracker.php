@@ -18,11 +18,22 @@ final class ClusterHealthTracker
     /** @var array<string, array{failures: int, last_success: float, opened_at: ?float}> */
     private array $state = [];
 
+    /** @var \Closure(): float */
+    private readonly \Closure $clock;
+
+    /**
+     * @param (\Closure(): float)|null $clock  seconds as a float; defaults to microtime(true)
+     */
+    public function __construct(?\Closure $clock = null)
+    {
+        $this->clock = $clock ?? static fn (): float => microtime(true);
+    }
+
     public function recordSuccess(string $clusterId): void
     {
         $this->state[$clusterId] = [
             'failures'     => 0,
-            'last_success' => microtime(true),
+            'last_success' => ($this->clock)(),
             'opened_at'    => null,
         ];
     }
@@ -41,8 +52,20 @@ final class ClusterHealthTracker
         // 0.0, so anchoring the cooldown there made isHealthy() compute an
         // elapsed time of "now minus the Unix epoch" — always >= 30s — and the
         // breaker never actually opened for a cluster with no prior success.
-        if ($this->state[$clusterId]['failures'] === self::UNHEALTHY_THRESHOLD) {
-            $this->state[$clusterId]['opened_at'] = microtime(true);
+        //
+        // A failure past the threshold is either a failed re-probe (the cooldown
+        // had elapsed, so isHealthy() let the attempt through) or a failure that
+        // was already in flight while the breaker was open. The first must start
+        // a fresh cooldown — otherwise opened_at stays stale and every later
+        // attempt is let through. The second must not extend the cooldown.
+        $failures = $this->state[$clusterId]['failures'];
+        $openedAt = $this->state[$clusterId]['opened_at'];
+        $now = ($this->clock)();
+        if ($failures === self::UNHEALTHY_THRESHOLD
+            || ($failures > self::UNHEALTHY_THRESHOLD
+                && ($openedAt === null || $now - $openedAt >= self::RECHECK_INTERVAL_SECONDS))
+        ) {
+            $this->state[$clusterId]['opened_at'] = $now;
         }
     }
 
@@ -67,7 +90,8 @@ final class ClusterHealthTracker
         // Re-probe after the recheck interval, counted from when the breaker
         // opened (see recordFailure()), not from the (possibly never-set)
         // last success.
-        $elapsed = microtime(true) - ($s['opened_at'] ?? microtime(true));
+        $now = ($this->clock)();
+        $elapsed = $now - ($s['opened_at'] ?? $now);
         return $elapsed >= self::RECHECK_INTERVAL_SECONDS;
     }
 

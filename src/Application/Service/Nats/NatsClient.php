@@ -102,17 +102,28 @@ final class NatsClient
         // which is fixed to 1.0s at construction (Configuration::$timeout). Without also
         // overriding it here, a caller-specified $timeoutSeconds (e.g. 5.0) is silently
         // capped at ~1s and the RuntimeException below lies about how long it waited.
+        //
+        // setTimeout() lazily opens the connection (Connection::init()), which can
+        // throw. The configuration change is therefore made inside the protected
+        // region so a failed setup still restores it — otherwise a later connect
+        // attempt would run with this request's timeout. The stream timeout is only
+        // restored when setup succeeded: restoring it would re-enter init().
         $previousTimeout = $this->client->configuration->timeout;
-        $this->client->configuration->timeout = $timeoutSeconds;
-        $this->client->setTimeout($timeoutSeconds);
+        $timeoutConfigured = false;
 
         try {
+            $this->client->configuration->timeout = $timeoutSeconds;
+            $this->client->setTimeout($timeoutSeconds);
+            $timeoutConfigured = true;
+
             $this->client->request($subject, $payload, function (string $body) use (&$response): void {
                 $response = $body;
             });
         } finally {
             $this->client->configuration->timeout = $previousTimeout;
-            $this->client->setTimeout($previousTimeout);
+            if ($timeoutConfigured) {
+                $this->client->setTimeout($previousTimeout);
+            }
         }
 
         if ($response === null) {

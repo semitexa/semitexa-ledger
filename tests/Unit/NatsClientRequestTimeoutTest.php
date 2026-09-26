@@ -76,6 +76,38 @@ final class NatsClientRequestTimeoutTest extends TestCase
         }
     }
 
+    #[Test]
+    public function a_connection_failure_during_setup_restores_the_configuration_timeout(): void
+    {
+        // Reserve a port, then release it so nothing listens there: the lazy
+        // connect inside setTimeout() is refused immediately.
+        $probe = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        if ($probe === false) {
+            self::fail("could not reserve a port: {$errstr}");
+        }
+        $name = (string) stream_socket_get_name($probe, false);
+        $port = (int) substr((string) strrchr($name, ':'), 1);
+        fclose($probe);
+
+        $client = new NatsClient(new ClusterConfig(id: 'test', url: "nats://127.0.0.1:{$port}"));
+        $inner = (new \ReflectionProperty(NatsClient::class, 'client'))->getValue($client);
+        self::assertInstanceOf(\Basis\Nats\Client::class, $inner);
+        $before = $inner->configuration->timeout;
+
+        try {
+            $client->request('some.subject', 'payload', $before + 4.0);
+            self::fail('expected the connection to be refused');
+        } catch (\Throwable) {
+            // expected: nothing listens on the port
+        }
+
+        self::assertSame(
+            $before,
+            $inner->configuration->timeout,
+            'a failed connection setup must not leave the request timeout on the shared configuration',
+        );
+    }
+
     /**
      * A minimal NATS server: accepts one connection, sends a bare INFO
      * message to satisfy Connection::init()'s handshake, then holds the
