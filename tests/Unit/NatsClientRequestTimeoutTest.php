@@ -94,12 +94,14 @@ final class NatsClientRequestTimeoutTest extends TestCase
         self::assertInstanceOf(\Basis\Nats\Client::class, $inner);
         $before = $inner->configuration->timeout;
 
+        $refused = false;
         try {
             $client->request('some.subject', 'payload', $before + 4.0);
-            self::fail('expected the connection to be refused');
         } catch (\Throwable) {
             // expected: nothing listens on the port
+            $refused = true;
         }
+        self::assertTrue($refused, 'expected the connection to be refused');
 
         self::assertSame(
             $before,
