@@ -101,15 +101,10 @@ final class NatsClientRequestTimeoutTest extends TestCase
             // expected: nothing listens on the port
             $failure = $e;
         }
-        self::assertNotNull($failure, 'expected the connection to be refused');
-        // request()'s own timeout is thrown only AFTER a completed setup, so
-        // it would mean something answered on the port and this test did not
-        // exercise the setup-failure path at all.
-        self::assertStringNotContainsString(
-            'timed out after',
-            $failure->getMessage(),
-            'expected a connection failure during setup, not the request timeout',
-        );
+        self::assertInstanceOf(\Throwable::class, $failure, 'expected the connection to be refused');
+        // Assert the refusal itself: request()'s own timeout (or any other
+        // failure) would mean this test never exercised the setup-failure path.
+        self::assertStringContainsString('Connection refused', $failure->getMessage());
 
         self::assertSame(
             $before,
