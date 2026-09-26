@@ -94,14 +94,22 @@ final class NatsClientRequestTimeoutTest extends TestCase
         self::assertInstanceOf(\Basis\Nats\Client::class, $inner);
         $before = $inner->configuration->timeout;
 
-        $refused = false;
+        $failure = null;
         try {
             $client->request('some.subject', 'payload', $before + 4.0);
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
             // expected: nothing listens on the port
-            $refused = true;
+            $failure = $e;
         }
-        self::assertTrue($refused, 'expected the connection to be refused');
+        self::assertNotNull($failure, 'expected the connection to be refused');
+        // request()'s own timeout is thrown only AFTER a completed setup, so
+        // it would mean something answered on the port and this test did not
+        // exercise the setup-failure path at all.
+        self::assertStringNotContainsString(
+            'timed out after',
+            $failure->getMessage(),
+            'expected a connection failure during setup, not the request timeout',
+        );
 
         self::assertSame(
             $before,
