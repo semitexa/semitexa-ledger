@@ -108,7 +108,9 @@ final class NatsClientRequestTimeoutTest extends TestCase
                 usleep(4_000_000);
                 fclose($conn);
             }
-            exit(0);
+            // Never exit() here: it would run the forked PHPUnit's shutdown
+            // handlers (result printing, junit) a second time.
+            posix_kill(posix_getpid(), SIGKILL);
         }
 
         $this->childPid = $pid;
