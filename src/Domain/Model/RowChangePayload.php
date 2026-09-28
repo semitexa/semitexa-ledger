@@ -13,6 +13,9 @@ namespace Semitexa\Ledger\Domain\Model;
  */
 final readonly class RowChangePayload
 {
+    /** The pseudo column that carries the row's existence; never a real field. */
+    public const EXISTS = '__exists';
+
     /**
      * @param array<string, FieldStamp> $fields column => stamp, the whole row
      */
@@ -40,7 +43,17 @@ final readonly class RowChangePayload
 
         $fields = [];
         foreach ($payload['fields'] as $column => $field) {
+            if ((string) $column === self::EXISTS) {
+                // It would shadow the separate existence stamp in the merge.
+                throw new \UnexpectedValueException("'" . self::EXISTS . "' is reserved and cannot be a field.");
+            }
             $fields[(string) $column] = FieldStamp::fromArray($field, (string) $column);
+        }
+
+        $exists = FieldStamp::fromArray($payload['exists'] ?? null, 'exists');
+        if (!is_bool($exists->value)) {
+            // "false" as a string would read as true.
+            throw new \UnexpectedValueException("A row change's 'exists' must be a boolean.");
         }
 
         try {
@@ -55,9 +68,22 @@ final readonly class RowChangePayload
             rowKey: self::string($payload, 'pk'),
             clock: $clock,
             node: self::string($payload, 'node', allowEmpty: true),
-            exists: FieldStamp::fromArray($payload['exists'] ?? null, 'exists'),
+            exists: $exists,
             fields: $fields,
         );
+    }
+
+    /** The latest clock anywhere in the change — the event's own, or any field's. */
+    public function latestClock(): HlcTimestamp
+    {
+        $latest = $this->clock;
+        foreach ([$this->exists, ...array_values($this->fields)] as $stamp) {
+            if ($stamp->clock->compareTo($latest) > 0) {
+                $latest = $stamp->clock;
+            }
+        }
+
+        return $latest;
     }
 
     /** @param array<mixed> $payload */

@@ -23,8 +23,11 @@ final class ReplicatedTables
         $tables   = [];
 
         foreach ($discovery->findClassesWithAttribute(Replicated::class) as $class) {
+            // Refuse rather than skip: a table silently missing from this map
+            // would have its changes refused as "not replicated here" — lost,
+            // where a failure is retried once the class loads again.
             if (!class_exists($class)) {
-                continue;
+                throw new \RuntimeException("#[Replicated] resource {$class} is listed by discovery but cannot be loaded.");
             }
             $metadata = $registry->for($class);
             if ($metadata->primaryKeyProperty === null) {

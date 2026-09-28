@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Tests\Integration;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Semitexa\Ledger\Application\Service\HybridLogicalClock;
@@ -210,6 +211,55 @@ final class RowChangeApplierMySqlTest extends TestCase
 
         $this->applyAll([$valid]);
         self::assertSame(['id' => self::ID, 'title' => 'T', 'body' => 'B'], $this->row());
+    }
+
+    /** @return iterable<string, array{\Closure(array<string, mixed>): array<string, mixed>}> */
+    public static function forgedOrBroken(): iterable
+    {
+        yield 'a binary value that is not base64' => [static function (array $e): array {
+            $e['fields']['body']['v'] = ['$b64' => '!!'];
+            return $e;
+        }];
+        yield 'a binary key that is not base64' => [static function (array $e): array {
+            $e['pk'] = 'b64:!!';
+            return $e;
+        }];
+        yield 'the existence pseudo column smuggled in as a field' => [static function (array $e): array {
+            $e['fields']['__exists'] = ['v' => false, 't' => '9999999999000.000000', 'n' => 'node-z'];
+            return $e;
+        }];
+        yield 'existence as the string "false"' => [static function (array $e): array {
+            $e['exists']['v'] = 'false';
+            return $e;
+        }];
+    }
+
+    /**
+     * @param \Closure(array<string, mixed>): array<string, mixed> $forge
+     */
+    #[Test]
+    #[DataProvider('forgedOrBroken')]
+    public function a_change_that_cannot_be_applied_as_sent_is_refused_without_writing_or_throwing(\Closure $forge): void
+    {
+        $existing = $this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a']);
+        $this->applyAll([$existing]);
+
+        $forged = $forge($this->event(['title' => ['T2', 200, 'node-b'], 'body' => ['B2', 200, 'node-b']], [false, 200, 'node-b']));
+        $this->applyAll([$forged]); // must neither throw (retried forever) nor write
+
+        self::assertSame(['id' => self::ID, 'title' => 'T', 'body' => 'B'], $this->row());
+    }
+
+    #[Test]
+    public function a_field_clock_far_ahead_is_refused_even_when_the_events_own_clock_is_not(): void
+    {
+        $now = (int) floor(microtime(true) * 1000);
+        $event = $this->event(['title' => ['T', 1, 'node-a'], 'body' => ['B', 1, 'node-a']], [true, 1, 'node-a']);
+        $event['hlc'] = (new HlcTimestamp($now, 0))->toString();
+        $event['fields']['title']['t'] = (new HlcTimestamp($now + 3_600_000, 0))->toString();
+
+        $this->expectException(ClockDriftException::class);
+        $this->applier()->apply($event, $this->db);
     }
 
     #[Test]

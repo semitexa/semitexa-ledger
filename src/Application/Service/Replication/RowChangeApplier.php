@@ -47,7 +47,15 @@ final class RowChangeApplier
     {
         try {
             $change = RowChangePayload::fromArray($payload);
-        } catch (\UnexpectedValueException $e) {
+            // Decode the key and every value before anything is read or
+            // written: a bad binary value found halfway would abort the write
+            // and be retried forever, holding back the origin's later events.
+            $pk      = RowCodec::decodeKey($change->rowKey);
+            $decoded = [];
+            foreach ($change->fields as $column => $field) {
+                $decoded[$column] = RowCodec::decodeValue($field->value);
+            }
+        } catch (\UnexpectedValueException|\InvalidArgumentException $e) {
             // Signed by a peer but not a row change: retrying cannot fix it, and
             // half of it is not applied. Refused here, and the event stays in
             // the ledger for inspection.
@@ -63,8 +71,10 @@ final class RowChangeApplier
 
         // A node whose clock runs far ahead would win every conflict for as
         // long as its lead lasted; its changes wait (the caller retries)
-        // until this node's own time is within the allowed drift.
-        $this->clock->observe($change->clock);
+        // until this node's own time is within the allowed drift. Every clock
+        // in the change counts — one future field stamp would otherwise win
+        // that field against every ordinary write after it.
+        $this->clock->observe($change->latestClock());
 
         // The table and key come off the wire. Only a table this node's own
         // code marks #[Replicated], keyed by its declared primary key, is
@@ -89,7 +99,6 @@ final class RowChangeApplier
         }
 
         $clocks = FieldClocks::lockAndRead($db, $table, $rowKey);
-        $pk     = RowCodec::decodeKey($rowKey);
         $row    = $this->lockRow($db, $table, $pkColumn, $pk);
 
         $won = [];
@@ -114,7 +123,7 @@ final class RowChangeApplier
         $values = [];
         foreach ($won as $column => $field) {
             if ($column !== ReplicationCaptureService::EXISTS) {
-                $values[$column] = RowCodec::decodeValue($field->value);
+                $values[$column] = $decoded[$column];
             }
         }
 
@@ -139,7 +148,7 @@ final class RowChangeApplier
                 if (in_array($column, $columns, true)) {
                     $full[$column] = array_key_exists($column, $values)
                         ? $values[$column]
-                        : ($base !== null && array_key_exists($column, $base) ? $base[$column] : RowCodec::decodeValue($field->value));
+                        : ($base !== null && array_key_exists($column, $base) ? $base[$column] : $decoded[$column]);
                     if ($base === null && !isset($won[$column]) && $clocks->of($column) === null) {
                         $won[$column] = $field;
                     }

@@ -7,6 +7,7 @@ namespace Semitexa\Ledger\Application\Service\Replication;
 use Semitexa\Ledger\Application\Service\HybridLogicalClock;
 use Semitexa\Ledger\Application\Service\UuidV7;
 use Semitexa\Ledger\Domain\Model\HlcTimestamp;
+use Semitexa\Ledger\Domain\Model\RowChangePayload;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Domain\Contract\ReplicationCaptureInterface;
 use Semitexa\Orm\Domain\Enum\ResourceChangeOperation;
@@ -24,7 +25,7 @@ use Semitexa\Orm\Domain\Model\RowChange;
  */
 final class ReplicationCaptureService implements ReplicationCaptureInterface
 {
-    public const EXISTS = '__exists';
+    public const EXISTS = RowChangePayload::EXISTS;
     public const EVENT_DOMAIN = 'replication';
     public const EVENT_TYPE = 'row_changed';
 
