@@ -17,7 +17,9 @@ use Semitexa\Ledger\Tests\Integration\Fixture\ReplicatedArticleMapper;
 use Semitexa\Ledger\Tests\Integration\Fixture\ReplicatedArticleResourceModel;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Application\Service\Mapping\MapperRegistry;
+use Semitexa\Orm\Application\Service\Persistence\ReplicatedWriteGuard;
 use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
+use Semitexa\Orm\Exception\ReplicatedTableWriteException;
 
 /**
  * Field-level merge of replicated row changes (ADR 0001), on MySQL.
@@ -197,6 +199,29 @@ final class RowChangeApplierMySqlTest extends TestCase
 
         self::assertNull($this->row());
         self::assertSame($before, (int) $this->db->execute('SELECT COUNT(*) AS c FROM replication_field_clock')->rows[0]['c']);
+    }
+
+    #[Test]
+    public function with_the_write_guard_armed_the_applier_still_writes_and_a_raw_write_does_not(): void
+    {
+        $registered = ReplicatedWriteGuard::registered();
+        ReplicatedWriteGuard::register(self::TABLE);
+        try {
+            $this->applyAll([$this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a'])]);
+            self::assertSame(['id' => self::ID, 'title' => 'T', 'body' => 'B'], $this->row(), 'the applier is a permitted writer');
+
+            try {
+                $this->db->execute('UPDATE ' . self::TABLE . " SET title = 'raw'");
+                self::fail('a raw write to a replicated table must be refused');
+            } catch (ReplicatedTableWriteException) {
+            }
+            self::assertSame('T', $this->row()['title'] ?? null);
+        } finally {
+            ReplicatedWriteGuard::reset();
+            foreach ($registered as $table) {
+                ReplicatedWriteGuard::register($table);
+            }
+        }
     }
 
     #[Test]
