@@ -37,6 +37,8 @@ use Swoole\Coroutine;
  */
 final class TwoNodeReplicationTest extends TestCase
 {
+    use RequiresNats;
+
     private const HMAC_KEY = 'it-shared-secret';
 
     private string $natsUrl;
@@ -46,28 +48,7 @@ final class TwoNodeReplicationTest extends TestCase
 
     protected function setUp(): void
     {
-        // First reachable wins. The dev .env points NATS_URL at 127.0.0.1 for
-        // the host, while inside the compose network the server is `nats`.
-        $candidates = array_filter([
-            getenv('LEDGER_TEST_NATS_URL'),
-            getenv('NATS_PRIMARY_URL'),
-            'nats://nats:4222',
-            getenv('NATS_URL'),
-        ]);
-        $url = null;
-        foreach (array_unique($candidates) as $candidate) {
-            $parts  = parse_url((string) $candidate);
-            $socket = @fsockopen($parts['host'] ?? 'localhost', $parts['port'] ?? 4222, $errno, $errstr, 1.0);
-            if ($socket !== false) {
-                fclose($socket);
-                $url = (string) $candidate;
-                break;
-            }
-        }
-        if ($url === null) {
-            self::markTestSkipped('No reachable NATS (tried ' . implode(', ', array_unique($candidates)) . '); set LEDGER_TEST_NATS_URL.');
-        }
-        $this->natsUrl = $url;
+        $this->natsUrl = self::reachableNatsUrl();
 
         $run = bin2hex(random_bytes(4));
         $this->stream = new EventStream("LEDGER_IT_{$run}", "semitexa.it{$run}.events");

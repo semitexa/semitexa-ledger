@@ -186,13 +186,20 @@ final class NatsClient
     /**
      * Create or resume a durable pull consumer on an existing stream.
      *
-     * @param int $startSequence  JetStream sequence to start from (0 = from beginning).
+     * An existing durable consumer keeps the configuration it was created
+     * with; these settings apply on first creation only.
+     *
+     * @param int        $startSequence   JetStream sequence to start from (0 = from beginning).
+     * @param float|null $ackWaitSeconds  How long a delivery may stay unacked before redelivery.
+     * @param int|null   $maxDeliver      Deliveries after which JetStream stops redelivering.
      */
     public function ensurePullConsumer(
         string $streamName,
         string $consumerName,
         string $filterSubject,
         int $startSequence = 0,
+        ?float $ackWaitSeconds = null,
+        ?int $maxDeliver = null,
     ): void {
         $api      = $this->client->getApi();
         $stream   = $api->getStream($streamName);
@@ -201,6 +208,13 @@ final class NatsClient
         $cfg = $consumer->getConfiguration();
         $cfg->setSubjectFilter($filterSubject);
         $cfg->setAckPolicy('explicit');
+
+        if ($ackWaitSeconds !== null) {
+            $cfg->setAckWait((int) ($ackWaitSeconds * 1_000_000_000));
+        }
+        if ($maxDeliver !== null) {
+            $cfg->setMaxDeliver($maxDeliver);
+        }
 
         if ($startSequence > 0) {
             $cfg->setDeliverPolicy(DeliverPolicy::BY_START_SEQUENCE);
@@ -267,6 +281,15 @@ final class NatsClient
         $info = $this->client->getApi()->getStream($streamName)->info();
 
         return (int) ($info->state->messages ?? 0);
+    }
+
+    /** Remove a durable consumer. Test and operator cleanup. */
+    public function deleteConsumer(string $streamName, string $consumerName): void
+    {
+        $consumer = $this->client->getApi()->getStream($streamName)->getConsumer($consumerName);
+        if ($consumer->exists()) {
+            $consumer->delete();
+        }
     }
 
     /** Remove a stream and every message in it. Test and operator cleanup. */
