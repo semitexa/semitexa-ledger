@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Nats;
 
+use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Support\Row;
 use Semitexa\Ledger\Domain\Model\ClusterConfig;
 
@@ -301,6 +302,63 @@ final class NatsClient
         }
 
         $consumer->create();
+
+        if ($ackWaitSeconds !== null || $maxDeliver !== null) {
+            $this->reconcileConsumer(
+                $streamName,
+                $consumerName,
+                $ackWaitSeconds !== null ? (int) ($ackWaitSeconds * 1_000_000_000) : null,
+                $maxDeliver,
+            );
+        }
+    }
+
+    /**
+     * Bring an EXISTING durable consumer's redelivery settings to what the
+     * caller needs. create() leaves an existing consumer as it is, and the
+     * legacy DURABLE.CREATE call answers "ok" on one without changing it — so
+     * a queue consumer made before acks moved after the handler kept the
+     * default 30 s ack_wait, and every job running longer than that was
+     * delivered a second time while the first was still working.
+     *
+     * Uses CONSUMER.CREATE with action=update (NATS 2.10+), which changes the
+     * editable fields in place. On an older server the consumer is left as it
+     * is and the mismatch is logged.
+     */
+    private function reconcileConsumer(string $streamName, string $consumerName, ?int $ackWaitNanos, ?int $maxDeliver): void
+    {
+        $info   = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
+        $config = $info instanceof Payload ? json_decode((string) json_encode($info->getValue('config')), true) : null;
+        if (!is_array($config)) {
+            return;
+        }
+
+        $wanted = array_filter(['ack_wait' => $ackWaitNanos, 'max_deliver' => $maxDeliver], static fn (?int $v): bool => $v !== null);
+        $stale  = array_filter($wanted, static fn (int $v, string $key): bool => ($config[$key] ?? null) !== $v, ARRAY_FILTER_USE_BOTH);
+        if ($stale === []) {
+            return;
+        }
+
+        try {
+            $this->client()->api("CONSUMER.CREATE.{$streamName}.{$consumerName}", [
+                'stream_name' => $streamName,
+                'config'      => array_replace($config, $stale),
+                'action'      => 'update',
+            ]);
+            StaticLoggerBridge::info('ledger', 'NATS consumer settings updated', ['consumer' => $consumerName, 'settings' => $stale]);
+        } catch (\Throwable $e) {
+            StaticLoggerBridge::warning('ledger', 'NATS consumer keeps outdated settings (server could not update it)', [
+                'consumer' => $consumerName,
+                'wanted'   => $stale,
+                'error'    => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /** One numeric setting of a durable consumer, e.g. 'ack_wait' (nanoseconds). */
+    public function consumerSetting(string $streamName, string $consumerName, string $setting): int
+    {
+        return self::apiInt($this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}"), "config.{$setting}");
     }
 
     /**
