@@ -126,6 +126,7 @@ final class LedgerReplayer
                 StandingCoroutines::busy(fn (): int => $this->pullAndProcess($client, $clusterId));
             } catch (\Throwable $e) {
                 unset($this->consumerReady[$clusterId]);
+                $client->reconnect();
                 StaticLoggerBridge::error('ledger', 'Replayer pull failed', ['cluster' => $clusterId, 'error' => $e->getMessage()]);
                 \Swoole\Coroutine::sleep(self::ERROR_SLEEP);
             }

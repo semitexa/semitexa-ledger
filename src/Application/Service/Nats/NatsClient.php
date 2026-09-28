@@ -24,7 +24,20 @@ use Basis\Nats\Message\Payload;
  */
 final class NatsClient
 {
-    private readonly Client $client;
+    /**
+     * Rebuilt after a failure, see {@see reconnect()}. Nullable only between a
+     * reconnect and the next call.
+     */
+    private ?Client $client;
+
+    /** @var array<string, mixed> */
+    private readonly array $options;
+
+    /** Seconds of empty pulls after which the connection is proven alive. */
+    private const LIVENESS_AFTER = 10.0;
+
+    /** When this connection last showed it was alive (a delivery or a PONG). */
+    private float $aliveAt;
 
     public function __construct(ClusterConfig $config)
     {
@@ -32,7 +45,13 @@ final class NatsClient
         $host   = $parsed['host'] ?? 'localhost';
         $port   = $parsed['port'] ?? 4222;
 
-        $options = ['host' => $host, 'port' => $port];
+        // The library's own reconnect is OFF. It retries forever, 1 ms apart,
+        // inside whatever call hit the failure — so during a partition the
+        // publisher or replayer coroutine never came back out, and after the
+        // network healed it stayed stuck (two-node harness, 2026-09-28).
+        // Failing fast and reconnecting here ({@see reconnect()}) keeps the
+        // callers' own retry and health tracking in charge.
+        $options = ['host' => $host, 'port' => $port, 'reconnect' => false];
 
         if ($config->credentialsPath !== null) {
             $options['nkey'] = $config->credentialsPath;
@@ -52,7 +71,58 @@ final class NatsClient
             ];
         }
 
-        $this->client = new Client(new Configuration($options));
+        $this->options = $options;
+        $this->client = $this->newClient();
+        $this->aliveAt = microtime(true);
+    }
+
+    /**
+     * Drop the connection so the next call opens a fresh one.
+     *
+     * A network partition leaves the TCP connection half-open: nothing tells
+     * the client it is dead, every later request on it times out, and the
+     * library never reconnects on its own. Measured in the two-node harness —
+     * after the network healed, both nodes kept failing with "Processing
+     * timeout" until restarted. Every operation below therefore reconnects on
+     * failure; the caller's retry then runs on a new socket.
+     */
+    public function reconnect(): void
+    {
+        $stale = $this->client;
+        $this->client = null;
+
+        try {
+            $stale?->disconnect();
+        } catch (\Throwable) {
+            // A dead socket cannot be closed cleanly; it is dropped either way.
+        }
+    }
+
+    private function newClient(): Client
+    {
+        $this->aliveAt = microtime(true);
+
+        return new Client(new Configuration($this->options));
+    }
+
+    private function client(): Client
+    {
+        return $this->client ??= $this->newClient();
+    }
+
+    /**
+     * @template T
+     * @param callable(): T $operation
+     * @return T
+     */
+    private function reconnectingOnFailure(callable $operation): mixed
+    {
+        try {
+            return $operation();
+        } catch (\Throwable $e) {
+            $this->reconnect();
+            throw $e;
+        }
     }
 
     /**
@@ -60,7 +130,7 @@ final class NatsClient
      */
     public function connect(): void
     {
-        $this->client->ping();
+        $this->reconnectingOnFailure(fn () => $this->client()->ping());
     }
 
     /**
@@ -80,7 +150,9 @@ final class NatsClient
      */
     public function jetStreamPublish(string $subject, string $payload, array $headers = [], float $timeoutSeconds = 5.0): int
     {
-        $reply = $this->client->dispatch($subject, new Payload($payload, $headers), $timeoutSeconds);
+        $reply = $this->reconnectingOnFailure(
+            fn () => $this->client()->dispatch($subject, new Payload($payload, $headers), $timeoutSeconds),
+        );
 
         $body = $reply instanceof Payload ? $reply->body : (string) $reply;
         $ack  = json_decode($body, true);
@@ -100,7 +172,7 @@ final class NatsClient
      */
     public function publish(string $subject, string $payload, ?string $replyTo = null): void
     {
-        $this->client->publish($subject, $payload, $replyTo);
+        $this->client()->publish($subject, $payload, $replyTo);
     }
 
     /**
@@ -126,21 +198,21 @@ final class NatsClient
         // region so a failed setup still restores it — otherwise a later connect
         // attempt would run with this request's timeout. The stream timeout is only
         // restored when setup succeeded: restoring it would re-enter init().
-        $previousTimeout = $this->client->configuration->timeout;
+        $previousTimeout = $this->client()->configuration->timeout;
         $timeoutConfigured = false;
 
         try {
-            $this->client->configuration->timeout = $timeoutSeconds;
-            $this->client->setTimeout($timeoutSeconds);
+            $this->client()->configuration->timeout = $timeoutSeconds;
+            $this->client()->setTimeout($timeoutSeconds);
             $timeoutConfigured = true;
 
-            $this->client->request($subject, $payload, function (string $body) use (&$response): void {
+            $this->client()->request($subject, $payload, function (string $body) use (&$response): void {
                 $response = $body;
             });
         } finally {
-            $this->client->configuration->timeout = $previousTimeout;
+            $this->client()->configuration->timeout = $previousTimeout;
             if ($timeoutConfigured) {
-                $this->client->setTimeout($previousTimeout);
+                $this->client()->setTimeout($previousTimeout);
             }
         }
 
@@ -159,7 +231,7 @@ final class NatsClient
      */
     public function ensureStream(string $streamName, array $config): void
     {
-        $api    = $this->client->getApi();
+        $api    = $this->client()->getApi();
         $stream = $api->getStream($streamName);
 
         $streamConfig = $stream->getConfiguration();
@@ -201,7 +273,7 @@ final class NatsClient
         ?float $ackWaitSeconds = null,
         ?int $maxDeliver = null,
     ): void {
-        $api      = $this->client->getApi();
+        $api      = $this->client()->getApi();
         $stream   = $api->getStream($streamName);
         $consumer = $stream->getConsumer($consumerName);
 
@@ -242,7 +314,13 @@ final class NatsClient
         int $batchSize = 50,
         float $waitSeconds = 1.0,
     ): array {
-        $consumer = $this->client->getApi()->getStream($streamName)->getConsumer($consumerName);
+        return $this->reconnectingOnFailure(fn (): array => $this->pull($streamName, $consumerName, $batchSize, $waitSeconds));
+    }
+
+    /** @return list<PulledMessage> */
+    private function pull(string $streamName, string $consumerName, int $batchSize, float $waitSeconds): array
+    {
+        $consumer = $this->client()->getApi()->getStream($streamName)->getConsumer($consumerName);
         $consumer->setBatching($batchSize)->setExpires($waitSeconds);
 
         // Read a little past the server-side expiry: a batch the server sends
@@ -254,7 +332,7 @@ final class NatsClient
         try {
             $raw = $queue->fetchAll($batchSize);
         } finally {
-            $this->client->unsubscribe($queue);
+            $this->client()->unsubscribe($queue);
         }
 
         $messages = [];
@@ -272,13 +350,41 @@ final class NatsClient
             );
         }
 
+        $this->assertAlive($messages !== []);
+
         return $messages;
+    }
+
+    /**
+     * A half-open connection — what a network partition leaves behind — does
+     * not fail a pull: the request goes into a dead socket and the pull simply
+     * returns nothing, forever, looking exactly like a quiet stream. Measured
+     * in the two-node harness: after the network healed, both replayers kept
+     * "pulling" empty batches and never received another event. So after a
+     * stretch of empty pulls the connection must answer a PING, or it is
+     * dropped and the caller's next pull opens a new one.
+     */
+    private function assertAlive(bool $delivered): void
+    {
+        $now = microtime(true);
+        if ($delivered) {
+            $this->aliveAt = $now;
+            return;
+        }
+        if ($now - $this->aliveAt < self::LIVENESS_AFTER) {
+            return;
+        }
+
+        if (!$this->client()->ping()) {
+            throw new \RuntimeException('NATS connection did not answer PING; reconnecting.');
+        }
+        $this->aliveAt = $now;
     }
 
     /** How many messages the stream currently holds. */
     public function streamMessageCount(string $streamName): int
     {
-        $info = $this->client->getApi()->getStream($streamName)->info();
+        $info = $this->client()->getApi()->getStream($streamName)->info();
 
         return (int) ($info->state->messages ?? 0);
     }
@@ -286,7 +392,7 @@ final class NatsClient
     /** Remove a durable consumer. Test and operator cleanup. */
     public function deleteConsumer(string $streamName, string $consumerName): void
     {
-        $consumer = $this->client->getApi()->getStream($streamName)->getConsumer($consumerName);
+        $consumer = $this->client()->getApi()->getStream($streamName)->getConsumer($consumerName);
         if ($consumer->exists()) {
             $consumer->delete();
         }
@@ -295,7 +401,7 @@ final class NatsClient
     /** Remove a stream and every message in it. Test and operator cleanup. */
     public function deleteStream(string $streamName): void
     {
-        $stream = $this->client->getApi()->getStream($streamName);
+        $stream = $this->client()->getApi()->getStream($streamName);
         if ($stream->exists()) {
             $stream->delete();
         }
@@ -307,7 +413,7 @@ final class NatsClient
      */
     public function subscribe(string $subject, callable $callback): void
     {
-        $this->client->subscribe($subject, function (Payload $payload) use ($callback): void {
+        $this->client()->subscribe($subject, function (Payload $payload) use ($callback): void {
             $callback($payload->body, $payload->replyTo, $payload);
         });
     }
@@ -317,6 +423,6 @@ final class NatsClient
      */
     public function process(float $timeoutSeconds = 0.0): void
     {
-        $this->client->process($timeoutSeconds);
+        $this->client()->process($timeoutSeconds);
     }
 }

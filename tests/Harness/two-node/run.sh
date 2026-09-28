@@ -7,6 +7,10 @@
 #   2. the same the other way round
 #   3. a burst of BURST probes from node-a all arrive on node-b in order,
 #      nothing quarantined, nothing left unapplied
+#   4. rows of a #[Replicated] resource written on one node appear on the other
+#   5. a partition: both nodes cut off from NATS, both edit the same rows —
+#      different fields, the same field, a delete against a later edit — and
+#      after the network heals both hold the same, expected rows
 #
 # Usage (from anywhere):
 #   packages/semitexa-ledger/tests/Harness/two-node/run.sh          # run, then tear down
@@ -46,9 +50,9 @@ trap cleanup EXIT
 
 # Wait until $2 (a shell snippet) succeeds, or fail with $1.
 wait_for() {
-    local what="$1" check="$2" deadline=$((SECONDS + WAIT_SECONDS))
+    local what="$1" check="$2" deadline=$((SECONDS + ${WAIT_SECONDS:-60}))
     until eval "$check" >/dev/null 2>&1; do
-        [ $SECONDS -lt $deadline ] || fail "timed out after ${WAIT_SECONDS}s waiting for $what"
+        [ $SECONDS -lt $deadline ] || fail "timed out waiting for $what"
         sleep 1
     done
 }
@@ -56,13 +60,15 @@ wait_for() {
 # json_field <json> <python expression over d>
 json_field() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print($2)" "$1"; }
 
-say "Infrastructure: mysql (node_a, node_b), nats, redis-a, redis-b"
+say "Infrastructure: nats, mysql-a, mysql-b, redis-a, redis-b"
 compose down -v --remove-orphans >/dev/null 2>&1 || true
-compose up -d --wait mysql nats redis-a redis-b >/dev/null
+compose up -d --wait nats mysql-a mysql-b redis-a redis-b >/dev/null
 
 for node in node-a node-b; do
     say "Schema on $node"
-    compose run --rm -T "$node" php vendor/bin/semitexa orm:sync --allow-destructive 2>&1 | tail -n 2
+    out="$(compose run --rm -T "$node" php vendor/bin/semitexa orm:sync --allow-destructive 2>&1)" \
+        || { printf '%s\n' "$out" | grep -v ' Container ' | tail -n 20; fail "orm:sync failed on $node"; }
+    printf '%s\n' "$out" | tail -n 2
 done
 
 say "Servers"
@@ -108,4 +114,55 @@ for node in node-a node-b; do
     cli "$node" ledger:verify >/dev/null || fail "ledger:verify failed on $node"
 done
 
-say "PASS: both directions + burst of $BURST, chains verified on both nodes"
+note() { local node="$1"; shift; cli "$node" harness:note "$@"; }
+dump() { cli "$1" harness:note dump; }
+wan() { # wan <connect|disconnect> <node>
+    docker network "$1" "semitexa-2node_wan" "$(compose ps -q "$2")"
+}
+N1=01a0e7b0-0000-7000-8000-000000000001
+N2=01a0e7b0-0000-7000-8000-000000000002
+N3=01a0e7b0-0000-7000-8000-000000000003
+
+say "4. replicated rows: node-a writes, node-b receives"
+note node-a create --id=$N1 --title=T1 --body=B1
+note node-a create --id=$N3 --title=T3 --body=B3
+wait_for "node-a's rows on node-b" '[ "$(dump node-b)" = "$(dump node-a)" ] && [ "$(dump node-b)" != "[]" ]'
+echo "node-b: $(dump node-b)"
+
+say "5. partition: both nodes cut off from NATS"
+wan disconnect node-a
+wan disconnect node-b
+note node-a set --id=$N1 --field=title --value=A-title
+note node-a create --id=$N2 --title=T2 --body=only-on-A
+note node-a delete --id=$N3
+sleep 1.2
+note node-b set --id=$N1 --field=body --value=B-body
+note node-b set --id=$N1 --field=title --value=B-title
+note node-b set --id=$N3 --field=body --value=B-kept-it
+sleep "${PARTITION_SECONDS:-10}"
+echo "during partition, node-a: $(dump node-a)"
+echo "during partition, node-b: $(dump node-b)"
+[ "$(dump node-a)" != "$(dump node-b)" ] || fail "the nodes agree during the partition — it did not hold"
+
+say "   heal"
+wan connect node-a
+wan connect node-b
+expected="$(python3 -c 'import json,sys; print(json.dumps(sorted([
+    {"id": sys.argv[1], "title": "B-title", "body": "B-body"},
+    {"id": sys.argv[2], "title": "T2", "body": "only-on-A"},
+    {"id": sys.argv[3], "title": "T3", "body": "B-kept-it"},
+], key=lambda r: r["id"]), ensure_ascii=False, separators=(",", ":")))' $N1 $N2 $N3)"
+same_as_expected() {
+    python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)' "$(dump "$1")" "$expected"
+}
+WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "node-a to converge after the heal" "same_as_expected node-a"
+WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "node-b to converge after the heal" "same_as_expected node-b"
+echo "both nodes: $(dump node-a)"
+
+for node in node-a node-b; do
+    cli "$node" ledger:verify >/dev/null || fail "ledger:verify failed on $node after the partition"
+    q="$(json_field "$(cli "$node" ledger:status --json)" "d['quarantined']")"
+    [ "$q" = 0 ] || fail "$node quarantined $q event(s)"
+done
+
+say "PASS: probes both ways + burst of $BURST; replicated rows converge after a partition (field merge, same-field LWW, delete vs later edit)"

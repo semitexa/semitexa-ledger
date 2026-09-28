@@ -135,6 +135,7 @@ final class LedgerPublisher
                 // Re-ensure the stream next time: a failure may mean it was
                 // deleted, and nothing else would ever create it again.
                 unset($this->streamReady[$clusterId]);
+                $client->reconnect();
                 $this->health->recordFailure($clusterId);
                 StaticLoggerBridge::warning('ledger', 'Publish failed', [
                     'event_id' => $event->eventId,
