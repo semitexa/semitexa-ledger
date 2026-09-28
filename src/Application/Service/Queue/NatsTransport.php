@@ -29,6 +29,9 @@ final class NatsTransport implements QueueTransportInterface
 
     private bool $streamReady = false;
 
+    /** Cleared by stop() to end consume() after the current batch. */
+    private bool $running = true;
+
     /** @var array<string, true> */
     private array $consumerReady = [];
 
@@ -45,10 +48,15 @@ final class NatsTransport implements QueueTransportInterface
         $client->jetStreamPublish($subject, $payload);
     }
 
+    public function stop(): void
+    {
+        $this->running = false;
+    }
+
     public function consume(string $queueName, callable $callback): void
     {
         // Blocking consume loop for queue:work command.
-        while (true) {
+        while ($this->running) {
             if ($this->consumeBatch($queueName, $callback) === 0) {
                 sleep(1);
             }
@@ -95,10 +103,19 @@ final class NatsTransport implements QueueTransportInterface
             try {
                 $callback($msg->body);
             } catch (\Throwable $e) {
-                StaticLoggerBridge::error('queue', 'NATS queue job failed, will be redelivered', [
-                    'queue' => $queueName,
-                    'error' => $e->getMessage(),
-                ]);
+                $context = [
+                    'queue'    => $queueName,
+                    'attempt'  => $msg->deliveryCount,
+                    'error'    => $e->getMessage(),
+                    'class'    => get_class($e),
+                    'trace'    => $e->getTraceAsString(),
+                ];
+                if ($msg->deliveryCount >= self::MAX_DELIVER) {
+                    // JetStream will not deliver it again: the job is gone.
+                    StaticLoggerBridge::error('queue', sprintf('NATS queue job dropped after %d attempts', self::MAX_DELIVER), $context);
+                } else {
+                    StaticLoggerBridge::error('queue', 'NATS queue job failed, will be redelivered', $context);
+                }
                 $msg->nak($this->retryDelaySeconds);
                 continue;
             }

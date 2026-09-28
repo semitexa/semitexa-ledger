@@ -70,6 +70,16 @@ final class RowCodec
 
         // Drivers return the same column as int or string depending on mode;
         // compare the stored representation, not the PHP type.
-        return (string) (is_bool($a) ? (int) $a : $a) === (string) (is_bool($b) ? (int) $b : $b);
+        return self::stored($a) === self::stored($b);
+    }
+
+    private static function stored(mixed $value): ?string
+    {
+        return match (true) {
+            is_bool($value)                   => $value ? '1' : '0',
+            is_int($value), is_float($value)  => (string) $value,
+            is_string($value)                 => $value,
+            default                           => null, // not a column value: never equal to one
+        };
     }
 }

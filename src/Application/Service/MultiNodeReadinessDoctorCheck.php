@@ -63,27 +63,47 @@ final class MultiNodeReadinessDoctorCheck implements DoctorCheckInterface
             $hints[]    = 'use the same long random LEDGER_HMAC_KEY on every node';
         }
 
+        // Settings that may be fine or may not, depending on what sits behind them.
+        $notes = [];
+        $noteHints = [];
+
         $storage = strtolower(trim((string) ($env['STORAGE_DRIVER'] ?? ''))) ?: 'local';
-        $storageNote = $storage === 'local'
-            ? 'STORAGE_DRIVER=local keeps uploads on this disk — fine only if var/uploads is a volume every node shares'
-            : null;
+        if ($storage === 'local') {
+            $notes[] = 'STORAGE_DRIVER=local keeps uploads on this disk — fine only if var/uploads is a volume every node shares';
+            $noteHints[] = 'STORAGE_DRIVER=s3 unless uploads are on a shared volume';
+        }
+
+        $redis = strtolower(trim((string) ($env['REDIS_HOST'] ?? '')));
+        if ($redis !== '' && self::isLoopback($redis)) {
+            // On two hosts, 127.0.0.1 is two different Redis servers — unless a
+            // local proxy or tunnel forwards to a shared one, which only the
+            // operator can know.
+            $notes[] = "REDIS_HOST={$redis} is this machine — sessions and cache are shared only if it forwards to one Redis every node uses";
+            $noteHints[] = 'REDIS_HOST pointing at the Redis all nodes share';
+        }
 
         if ($blocking !== []) {
             return DoctorResult::fail(
-                "Node '{$nodeId}' is not ready to run beside other nodes: " . implode('; ', $blocking)
-                    . ($storageNote !== null ? "; {$storageNote}" : '') . '.',
-                ucfirst(implode(', ', $hints))
-                    . ($storageNote !== null ? ', and STORAGE_DRIVER=s3 unless uploads are on a shared volume' : '') . '.',
+                "Node '{$nodeId}' is not ready to run beside other nodes: " . implode('; ', [...$blocking, ...$notes]) . '.',
+                ucfirst(implode(', ', [...$hints, ...$noteHints])) . '.',
             );
         }
 
-        if ($storageNote !== null) {
+        if ($notes !== []) {
             return DoctorResult::warn(
-                "Node '{$nodeId}': {$storageNote}.",
-                'Set STORAGE_DRIVER=s3, or mount var/uploads from shared storage on every node.',
+                "Node '{$nodeId}': " . implode('; ', $notes) . '.',
+                'Set ' . implode(', and ', $noteHints) . '.',
             );
         }
 
         return DoctorResult::pass("Node '{$nodeId}': sessions, cache and storage are shared between nodes.");
+    }
+
+    private static function isLoopback(string $host): bool
+    {
+        return $host === 'localhost'
+            || $host === '::1'
+            || $host === '[::1]'
+            || str_starts_with($host, '127.');
     }
 }

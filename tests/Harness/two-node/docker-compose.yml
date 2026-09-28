@@ -72,7 +72,7 @@ networks:
 
 services:
   nats:
-    image: nats:latest
+    image: nats:2.12
     command: ["--jetstream"]
     networks: [wan]
 

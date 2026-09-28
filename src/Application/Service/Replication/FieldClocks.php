@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Replication;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Ledger\Domain\Model\HlcTimestamp;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Adapter\ServerCapability;
@@ -30,7 +31,8 @@ final class FieldClocks
 
         $byColumn = [];
         foreach ($rows as $row) {
-            $byColumn[(string) $row['column_name']] = [(string) $row['hlc'], (string) $row['node']];
+            $r = Row::of($row);
+            $byColumn[$r->string('column_name')] = [$r->string('hlc'), $r->string('node')];
         }
 
         return new self($byColumn);

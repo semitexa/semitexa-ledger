@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Replication;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 
 /** The last image of hard-deleted replicated rows (see ReplicationTombstoneResourceModel). */
@@ -35,9 +36,17 @@ final class Tombstones
             return null;
         }
 
-        $image = json_decode((string) $row['image'], true, 512, JSON_THROW_ON_ERROR);
+        $image = json_decode(Row::of($row)->string('image'), true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($image)) {
+            return null;
+        }
 
-        return is_array($image) ? array_map(RowCodec::decodeValue(...), $image) : null;
+        $values = [];
+        foreach ($image as $column => $value) {
+            $values[(string) $column] = RowCodec::decodeValue($value);
+        }
+
+        return $values;
     }
 
     public static function remove(DatabaseAdapterInterface $db, string $table, string $rowKey): void

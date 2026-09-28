@@ -23,7 +23,6 @@ use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 use Semitexa\Ledger\Application\Service\Nats\EventStream;
 use Semitexa\Ledger\Application\Service\Replication\ReplicationCaptureService;
 use Semitexa\Ledger\Application\Service\Replication\ReplicationRelay;
-use Semitexa\Ledger\Application\Service\Replication\RowChangedReplayHandler;
 use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 use Semitexa\Ledger\Application\Service\OwnershipCache;
@@ -151,6 +150,9 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         // By default uses the 'default' connection; override via LEDGER_DB_CONNECTION env var.
         $dbConnection = (string) (getenv('LEDGER_DB_CONNECTION') ?: 'default');
         $connectionRegistry = $container->get(ConnectionRegistry::class);
+        if (!$connectionRegistry instanceof ConnectionRegistry) {
+            throw new \RuntimeException('LedgerBootstrap needs the ORM ConnectionRegistry in the container.');
+        }
         $ownershipAdapter = $connectionRegistry->manager($dbConnection)->getAdapter();
 
         $ownership = new AggregateOwnershipService(
@@ -181,9 +183,6 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         );
 
         if ($this->ownsBackgroundLoops($context)) {
-            $rowChanges = new RowChangedReplayHandler(
-                static fn (callable $work): mixed => $connectionRegistry->manager($dbConnection)->getTransactionManager()->run($work),
-            );
             $relay = new ReplicationRelay(
                 $writer,
                 static fn (): \Semitexa\Orm\Adapter\DatabaseAdapterInterface => $connectionRegistry->manager($dbConnection)->getAdapter(),
@@ -198,11 +197,7 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
                 $handlerRegistry,
                 $ownership,
                 $commandRegistry,
-                // The row-change handler needs the application database's
-                // transactions, which the container cannot hand a constructor.
-                static fn (string $class): object => $class === RowChangedReplayHandler::class
-                    ? $rowChanges
-                    : $container->resolve($class),
+                static fn (string $class): object => $container->resolve($class),
             );
         }
 

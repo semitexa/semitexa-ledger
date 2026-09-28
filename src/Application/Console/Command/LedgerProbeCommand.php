@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Console\Command;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Core\Attribute\AsCommand;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Console\BaseCommand;
@@ -78,7 +79,7 @@ final class LedgerProbeCommand extends BaseCommand
         );
 
         $probeId = UuidV7::generate();
-        $note    = (string) $input->getOption('note');
+        $note    = Row::asString($input->getOption('note'));
         $event   = (new LedgerWriter($db, $nodeId, $hmacKey, $ownership))
             ->append(LedgerProbeRecorded::of($probeId, $note));
 

@@ -35,8 +35,12 @@ final class ReplicationCaptureMySqlTest extends TestCase
 
     private string $ledgerFile;
 
+    /** The resolver in place before the test — a process-global, put back after. */
+    private ?\Closure $previousResolver;
+
     protected function setUp(): void
     {
+        $this->previousResolver = ReplicationCapture::resolver();
         $this->connectWithReplicationTables();
 
         ReplicationCapture::setResolver(static fn (): ReplicationCaptureService => new ReplicationCaptureService('node-a', new HybridLogicalClock()));
@@ -45,7 +49,7 @@ final class ReplicationCaptureMySqlTest extends TestCase
 
     protected function tearDown(): void
     {
-        ReplicationCapture::setResolver(null);
+        ReplicationCapture::setResolver($this->previousResolver);
         $this->dropReplicationFixture();
         foreach (isset($this->ledgerFile) ? [$this->ledgerFile, "{$this->ledgerFile}-wal", "{$this->ledgerFile}-shm"] : [] as $f) {
             if (is_file($f)) {
@@ -146,6 +150,29 @@ final class ReplicationCaptureMySqlTest extends TestCase
         self::assertCount(2, $events, 'the repeated append must not create a second event');
         self::assertSame(array_column($pending, 'event_id'), array_column($events, 'event_id'));
         self::assertSame(['replication', 'row_changed'], [$events[0]['domain'], $events[0]['event_type']]);
+    }
+
+    #[Test]
+    public function a_row_that_can_never_be_relayed_is_set_aside_and_the_rows_behind_it_move_on(): void
+    {
+        $engine = $this->orm->getAggregateWriteEngine();
+        $engine->insert(new ReplicatedArticle('', 'A', '1'), ReplicatedArticleResourceModel::class, $this->mappers());
+        $this->db->execute(
+            "INSERT INTO replication_outbox (event_id, payload, created_at) VALUES ('01a0e900-0000-7000-8000-00000000dead', '{not json', UTC_TIMESTAMP())",
+        );
+        $engine->insert(new ReplicatedArticle('', 'B', '2'), ReplicatedArticleResourceModel::class, $this->mappers());
+
+        $ledger = new LedgerConnection($this->ledgerFile);
+        (new LedgerSchema($ledger, 'node-a'))->migrate();
+        $relay = new ReplicationRelay($this->writer($ledger), fn (): DatabaseAdapterInterface => $this->db);
+
+        self::assertSame(3, $relay->relayBatch());
+        self::assertSame([], $this->outbox(), 'nothing may stay stuck behind the bad row');
+        self::assertSame(2, (int) $ledger->fetchScalar('SELECT COUNT(*) FROM events'));
+        self::assertSame(
+            [['event_id' => '01a0e900-0000-7000-8000-00000000dead', 'payload' => '{not json']],
+            $this->db->execute('SELECT event_id, payload FROM replication_outbox_dead')->rows,
+        );
     }
 
     /** @return list<array<string, mixed>> */

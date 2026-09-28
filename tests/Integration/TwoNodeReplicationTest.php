@@ -143,6 +143,24 @@ final class TwoNodeReplicationTest extends TestCase
     }
 
     #[Test]
+    public function an_origins_events_apply_in_order_even_when_an_earlier_one_has_to_be_retried(): void
+    {
+        $this->inCoroutine(function (): void {
+            $a = $this->node('a');
+            $b = $this->node('b');
+            $b->handler->failNext = 1;
+
+            $a->writer->append(ReplicationProbeRecorded::of('p1', 'first — its apply fails once'));
+            $a->writer->append(ReplicationProbeRecorded::of('p2', 'second'));
+            self::assertSame(2, $a->publisher->publishBatch());
+
+            $this->drain($b, until: fn (): bool => count($b->handler->applied) >= 2, seconds: 10.0);
+
+            self::assertSame(['p1', 'p2'], $b->handler->applied, 'p2 must wait for p1 to apply');
+        });
+    }
+
+    #[Test]
     public function an_event_that_would_propagate_without_its_data_is_refused(): void
     {
         $this->inCoroutine(function (): void {

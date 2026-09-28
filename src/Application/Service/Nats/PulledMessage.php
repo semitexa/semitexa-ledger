@@ -24,6 +24,8 @@ final class PulledMessage
         public readonly int $streamSequence,
         private readonly \Closure $ack,
         private readonly \Closure $nak,
+        /** Which delivery of this message this is (1 = first); 0 when unknown. */
+        public readonly int $deliveryCount = 0,
     ) {}
 
     public function ack(): void
@@ -45,6 +47,18 @@ final class PulledMessage
      */
     public static function streamSequenceFromReplyTo(?string $replyTo): int
     {
+        return self::ackToken($replyTo, 1);
+    }
+
+    /** The delivery count sits just before the stream sequence. */
+    public static function deliveryCountFromReplyTo(?string $replyTo): int
+    {
+        return self::ackToken($replyTo, 0);
+    }
+
+    /** Token $offset of <delivered>.<streamSeq>.<consumerSeq>… , or 0. */
+    private static function ackToken(?string $replyTo, int $offset): int
+    {
         if ($replyTo === null || !str_starts_with($replyTo, '$JS.ACK.')) {
             return 0;
         }
@@ -52,16 +66,14 @@ final class PulledMessage
         $tokens = explode('.', $replyTo);
         $count  = count($tokens);
 
-        $index = match (true) {
-            $count === 9  => 5,
-            $count >= 11  => 7,
+        $delivered = match (true) {
+            $count === 9  => 4,
+            $count >= 11  => 6,
             default       => -1,
         };
 
-        if ($index < 0 || !ctype_digit($tokens[$index] ?? '')) {
-            return 0;
-        }
+        $token = $delivered < 0 ? '' : ($tokens[$delivered + $offset] ?? '');
 
-        return (int) $tokens[$index];
+        return ctype_digit($token) ? (int) $token : 0;
     }
 }

@@ -82,6 +82,48 @@ final class NatsQueueTransportTest extends TestCase
         }
 
         self::assertSame(['job-1', 'job-2', 'job-1'], $seen);
+        self::assertSame(0, $this->pendingAcks(), 'every handled delivery must have been acked, not left to time out');
+    }
+
+    #[Test]
+    public function a_job_with_an_empty_body_reaches_the_handler_and_is_acked(): void
+    {
+        $seen = null;
+        $failure = null;
+
+        Coroutine\run(function () use (&$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue, '');
+
+                $deadline = microtime(true) + 5.0;
+                while ($seen === null && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$seen): void {
+                        $seen = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame('', $seen, 'an empty job is a delivery, not a status frame');
+        self::assertSame(0, $this->pendingAcks());
+    }
+
+    private function pendingAcks(): int
+    {
+        $pending = null;
+        Coroutine\run(function () use (&$pending): void {
+            $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+            $pending = $client->pendingAcks('QUEUE', NatsTransport::consumerName($this->queue));
+        });
+
+        return (int) $pending;
     }
 
     private function transport(): NatsTransport

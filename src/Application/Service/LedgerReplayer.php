@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
@@ -28,6 +29,8 @@ use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
  *                                  and never applied (a handler failed).
  *  3. Sequence gap               → nak with a delay; the missing predecessor is
  *                                  in the stream and arrives first on redelivery.
+ *     Earlier event unapplied    → nak with a delay: a handler never sees an
+ *                                  origin's events out of order.
  *  4. Hash chain / HMAC mismatch → quarantine, ack. Never applied.
  *  5. Apply failure              → nak with a delay; the stored row carries no
  *                                  applied_at, so step 2 retries it.
@@ -199,6 +202,25 @@ final class LedgerReplayer
                 'origin'   => $event->originNode,
                 'expected' => $expectedSeq,
                 'got'      => $event->sequence,
+            ]);
+            return;
+        }
+
+        // Per-origin order: an earlier event from this origin that is stored
+        // but not yet applied (its handler failed) must apply first. Without
+        // this, N+1 passed the sequence check while N waited for redelivery,
+        // and a handler saw N+1 before N — a later price overwritten by an
+        // earlier one. N itself is retried through the duplicate path above.
+        $blocked = $this->db->fetchOne(
+            "SELECT sequence FROM events WHERE origin_node = :node AND source = 'remote' AND applied_at IS NULL ORDER BY sequence LIMIT 1",
+            ['node' => $event->originNode]
+        );
+        if ($blocked !== null) {
+            $msg->nak(self::RETRY_DELAY);
+            StaticLoggerBridge::warning('ledger', 'Waiting for an earlier event from the same origin to apply', [
+                'origin'  => $event->originNode,
+                'waiting' => $event->sequence,
+                'on'      => Row::of($blocked)->int('sequence'),
             ]);
             return;
         }

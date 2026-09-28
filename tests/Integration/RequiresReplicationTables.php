@@ -43,6 +43,10 @@ trait RequiresReplicationTables
             . 'payload LONGTEXT NOT NULL, created_at DATETIME NOT NULL, UNIQUE KEY uniq_replication_outbox_event (event_id))'
         );
         $this->db->execute(
+            'CREATE TABLE IF NOT EXISTS replication_outbox_dead (id BIGINT AUTO_INCREMENT PRIMARY KEY, event_id VARCHAR(36) NOT NULL, '
+            . 'payload LONGTEXT NOT NULL, error VARCHAR(500) NOT NULL, failed_at DATETIME NOT NULL, UNIQUE KEY uniq_replication_outbox_dead_event (event_id))'
+        );
+        $this->db->execute(
             'CREATE TABLE IF NOT EXISTS replication_tombstone (id BIGINT AUTO_INCREMENT PRIMARY KEY, table_name VARCHAR(64) NOT NULL, '
             . 'row_pk VARCHAR(191) NOT NULL, image LONGTEXT NOT NULL, UNIQUE KEY uniq_replication_tombstone (table_name, row_pk))'
         );
@@ -55,6 +59,7 @@ trait RequiresReplicationTables
         $this->db->execute('DELETE FROM replication_field_clock WHERE table_name = :t', ['t' => self::ARTICLES]);
         $this->db->execute('DELETE FROM replication_tombstone WHERE table_name = :t', ['t' => self::ARTICLES]);
         $this->db->execute('DELETE FROM replication_outbox');
+        $this->db->execute('DELETE FROM replication_outbox_dead');
     }
 
     private function dropReplicationFixture(): void

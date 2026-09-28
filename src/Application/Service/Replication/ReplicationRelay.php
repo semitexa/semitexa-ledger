@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service\Replication;
 
 use Semitexa\Core\Log\StaticLoggerBridge;
+use Semitexa\Ledger\Domain\Model\RowChangePayload;
+use Semitexa\Core\Support\Row;
 use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Application\Service\LedgerWriter;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
@@ -31,7 +33,16 @@ final class ReplicationRelay
         private readonly \Closure $adapter,
     ) {}
 
-    /** Relay up to one batch, oldest first. Returns how many were moved. */
+    /**
+     * Relay up to one batch, oldest first. Returns how many rows left the
+     * outbox (moved to the ledger, or dead-lettered).
+     *
+     * A row that can never be relayed — its payload does not decode, or is not
+     * an event — goes to replication_outbox_dead, so it cannot hold back the
+     * changes behind it. Any other failure (the ledger file busy, say) stops
+     * the batch at that row and leaves it in place: order is kept and the next
+     * pass retries it.
+     */
     public function relayBatch(): int
     {
         $db   = ($this->adapter)();
@@ -39,22 +50,63 @@ final class ReplicationRelay
             'SELECT id, event_id, payload FROM replication_outbox ORDER BY id LIMIT ' . self::BATCH,
         )->rows;
 
-        foreach ($rows as $row) {
-            $payload = json_decode((string) $row['payload'], true, 512, JSON_THROW_ON_ERROR);
-            if (!is_array($payload)) {
-                throw new \UnexpectedValueException("Outbox row {$row['id']} holds no event payload.");
-            }
+        $moved = 0;
+        foreach ($rows as $raw) {
+            $row = Row::of($raw);
+            $id  = $row->int('id');
 
-            $this->writer->appendRecord(
-                (string) $row['event_id'],
-                ReplicationCaptureService::EVENT_DOMAIN,
-                ReplicationCaptureService::EVENT_TYPE,
-                $payload,
-            );
-            $db->execute('DELETE FROM replication_outbox WHERE id = :id', ['id' => $row['id']]);
+            try {
+                $payload = json_decode($row->string('payload'), true, 512, JSON_THROW_ON_ERROR);
+                RowChangePayload::fromArray($payload); // the shape the peers will need
+            } catch (\JsonException|\UnexpectedValueException $e) {
+                $this->deadLetter($db, $id, $row->string('event_id'), $row->string('payload'), $e);
+                $moved++;
+                continue;
+            }
+            /** @var array<string, mixed> $payload checked by RowChangePayload::fromArray() */
+
+            try {
+                $this->writer->appendRecord(
+                    $row->string('event_id'),
+                    ReplicationCaptureService::EVENT_DOMAIN,
+                    ReplicationCaptureService::EVENT_TYPE,
+                    $payload,
+                );
+            } catch (\Throwable $e) {
+                throw new \RuntimeException(
+                    sprintf('Relaying outbox row %d (event %s) failed: %s', $id, $row->string('event_id'), $e->getMessage()),
+                    0,
+                    $e,
+                );
+            }
+            $db->execute('DELETE FROM replication_outbox WHERE id = :id', ['id' => $id]);
+            $moved++;
         }
 
-        return count($rows);
+        return $moved;
+    }
+
+    private function deadLetter(DatabaseAdapterInterface $db, int $id, string $eventId, string $payload, \Throwable $reason): void
+    {
+        $db->execute(
+            'INSERT IGNORE INTO replication_outbox_dead (event_id, payload, error, failed_at) VALUES (:e, :p, :r, :at)',
+            ['e' => $eventId, 'p' => $payload, 'r' => mb_substr($reason->getMessage(), 0, 500), 'at' => gmdate('Y-m-d H:i:s')],
+        );
+        $db->execute('DELETE FROM replication_outbox WHERE id = :id', ['id' => $id]);
+
+        StaticLoggerBridge::error('ledger', 'Outbox row can never be relayed; moved to replication_outbox_dead', [
+            'outbox_id' => $id,
+            'event_id'  => $eventId,
+            'error'     => $reason->getMessage(),
+        ]);
+    }
+
+    private bool $running = true;
+
+    /** End run() after the current pass. */
+    public function stop(): void
+    {
+        $this->running = false;
     }
 
     public function run(): void
@@ -64,11 +116,18 @@ final class ReplicationRelay
             'moving captured row changes into the ledger — sleeps between batches, by design',
         );
 
-        while (true) {
+        while ($this->running) {
             try {
                 $moved = StandingCoroutines::busy(fn (): int => $this->relayBatch());
             } catch (\Throwable $e) {
-                StaticLoggerBridge::error('ledger', 'Replication relay batch failed', ['error' => $e->getMessage()]);
+                // The failing row stays at the head of the outbox and is retried
+                // every pass; while it fails, none of this node's later changes
+                // leave it. The message names the row — a failure that repeats
+                // here is replication from this node standing still.
+                StaticLoggerBridge::error('ledger', 'Replication relay stalled on an outbox row', [
+                    'error' => $e->getMessage(),
+                    'class' => get_class($e->getPrevious() ?? $e),
+                ]);
                 $moved = 0;
             }
 

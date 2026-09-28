@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Console\Command;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Core\Attribute\AsCommand;
 use Semitexa\Ledger\Application\Service\LedgerConnection;
 use Symfony\Component\Console\Command\Command;
@@ -101,23 +102,25 @@ final class LedgerStatusCommand extends Command
                     SUM(CASE WHEN source = 'remote' AND applied_at IS NULL THEN 1 ELSE 0 END) AS unapplied
              FROM events GROUP BY origin_node, source ORDER BY origin_node"
         ) as $row) {
+            $r = Row::of($row);
             $origins[] = [
-                'origin'          => (string) $row['origin_node'],
-                'source'          => (string) $row['source'],
-                'events'          => (int) $row['events'],
-                'last_sequence'   => (int) $row['last_sequence'],
-                'pending_publish' => (int) $row['pending_publish'],
-                'unapplied'       => (int) $row['unapplied'],
+                'origin'          => $r->string('origin_node'),
+                'source'          => $r->string('source'),
+                'events'          => $r->int('events'),
+                'last_sequence'   => $r->int('last_sequence'),
+                'pending_publish' => $r->int('pending_publish'),
+                'unapplied'       => $r->int('unapplied'),
             ];
         }
 
         $consumers = [];
         foreach ($db->fetchAll('SELECT consumer_id, cluster_id, last_nats_sequence, updated_at FROM consumer_state ORDER BY cluster_id') as $row) {
+            $r = Row::of($row);
             $consumers[] = [
-                'consumer'   => (string) $row['consumer_id'],
-                'cluster'    => (string) $row['cluster_id'],
-                'position'   => (int) $row['last_nats_sequence'],
-                'updated_at' => (string) $row['updated_at'],
+                'consumer'   => $r->string('consumer_id'),
+                'cluster'    => $r->string('cluster_id'),
+                'position'   => $r->int('last_nats_sequence'),
+                'updated_at' => $r->string('updated_at'),
             ];
         }
 
@@ -139,7 +142,7 @@ final class LedgerStatusCommand extends Command
         return [
             'node'        => $nodeId,
             'origins'     => $origins,
-            'quarantined' => (int) $db->fetchScalar('SELECT COUNT(*) FROM quarantined_events WHERE resolved_at IS NULL'),
+            'quarantined' => Row::asInt($db->fetchScalar('SELECT COUNT(*) FROM quarantined_events WHERE resolved_at IS NULL')),
             'consumers'   => $consumers,
             'probe'       => $probe,
         ];

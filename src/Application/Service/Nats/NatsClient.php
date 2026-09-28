@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Nats;
 
+use Semitexa\Core\Support\Row;
 use Semitexa\Ledger\Domain\Model\ClusterConfig;
 
 use Basis\Nats\Client;
@@ -102,6 +103,9 @@ final class NatsClient
     {
         $this->aliveAt = microtime(true);
 
+        // 'tls' is an array of stream-context options, which Configuration
+        // accepts at runtime though its docblock types only scalars.
+        /** @phpstan-ignore argument.type */
         return new Client(new Configuration($this->options));
     }
 
@@ -154,17 +158,18 @@ final class NatsClient
             fn () => $this->client()->dispatch($subject, new Payload($payload, $headers), $timeoutSeconds),
         );
 
-        $body = $reply instanceof Payload ? $reply->body : (string) $reply;
+        $body = $reply instanceof Payload ? $reply->body : (is_string($reply) ? $reply : '');
         $ack  = json_decode($body, true);
 
-        if (!is_array($ack) || isset($ack['error']) || !isset($ack['seq'])) {
-            $reason = is_array($ack) && isset($ack['error']['description'])
-                ? (string) $ack['error']['description']
+        if (!is_array($ack) || isset($ack['error']) || !is_int($ack['seq'] ?? null)) {
+            $error  = is_array($ack) && is_array($ack['error'] ?? null) ? $ack['error'] : [];
+            $reason = is_string($error['description'] ?? null)
+                ? $error['description']
                 : ($body === '' ? 'no stream captured the subject' : $body);
             throw new \RuntimeException("JetStream refused publish to '{$subject}': {$reason}");
         }
 
-        return (int) $ack['seq'];
+        return $ack['seq'];
     }
 
     /**
@@ -337,8 +342,11 @@ final class NatsClient
 
         $messages = [];
         foreach ($raw as $msg) {
-            if (!$msg instanceof Msg || $msg->payload->isEmpty()) {
-                // Status frames (404 no messages, 408 request timeout) carry no body.
+            // Status frames (404 no messages, 408 request timeout) are told
+            // apart by their Status-Code header, not by an empty body: a job
+            // published with an empty body is a real delivery that must reach
+            // the callback and be acked.
+            if (!$msg instanceof Msg || ($msg->payload->isEmpty() && $msg->payload->getHeader('Status-Code') !== null)) {
                 continue;
             }
 
@@ -347,6 +355,7 @@ final class NatsClient
                 streamSequence: PulledMessage::streamSequenceFromReplyTo($msg->replyTo),
                 ack:            static fn () => $msg->ack(),
                 nak:            static fn (float $delay) => $msg->nack($delay),
+                deliveryCount:  PulledMessage::deliveryCountFromReplyTo($msg->replyTo),
             );
         }
 
@@ -384,9 +393,38 @@ final class NatsClient
     /** How many messages the stream currently holds. */
     public function streamMessageCount(string $streamName): int
     {
-        $info = $this->client()->getApi()->getStream($streamName)->info();
+        return self::apiInt($this->client()->getApi()->getStream($streamName)->info(), 'state.messages');
+    }
 
-        return (int) ($info->state->messages ?? 0);
+    /** Whether the server runs JetStream (a plain NATS server answers with an error). */
+    public function hasJetStream(): bool
+    {
+        try {
+            $this->client()->getApi()->getInfo();
+
+            return true;
+        } catch (\Throwable) {
+            $this->reconnect();
+
+            return false;
+        }
+    }
+
+    /** Deliveries of a consumer still waiting for an ack. */
+    public function pendingAcks(string $streamName, string $consumerName): int
+    {
+        return self::apiInt($this->client()->getApi()->getStream($streamName)->getConsumer($consumerName)->info(), 'num_ack_pending');
+    }
+
+    /**
+     * A number from a JetStream API reply. The reply is a Payload whose fields
+     * are read through a magic __get with no __isset — so `isset($reply->x)`
+     * and `$reply->x ?? 0` are always "missing", and every count read that
+     * way was 0. getValue() walks the decoded body by a dotted path.
+     */
+    private static function apiInt(mixed $reply, string $path): int
+    {
+        return $reply instanceof Payload ? Row::asInt($reply->getValue($path)) : 0;
     }
 
     /** Remove a durable consumer. Test and operator cleanup. */

@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service\Replication;
 
 use Semitexa\Core\Log\StaticLoggerBridge;
+use Semitexa\Core\Support\Row;
 use Semitexa\Ledger\Application\Service\HybridLogicalClock;
+use Semitexa\Ledger\Domain\Model\FieldStamp;
 use Semitexa\Ledger\Domain\Model\HlcTimestamp;
+use Semitexa\Ledger\Domain\Model\RowChangePayload;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Adapter\ServerCapability;
 use Semitexa\Orm\Adapter\SqlIdentifier;
@@ -24,35 +27,64 @@ use Semitexa\Orm\Adapter\SqlIdentifier;
  */
 final class RowChangeApplier
 {
-    /** @var array<string, list<string>|null> table => its columns, or null when it does not exist here */
+    /** @var array<string, list<string>> table => its columns; only tables that exist */
     private array $columnsByTable = [];
 
+    /**
+     * @param array<string, string> $replicatedTables table => primary-key column, for the
+     *        resources this node's code marks #[Replicated] (see ReplicatedTables). The table
+     *        and key in an event come off the wire; nothing outside this map is ever written.
+     */
     public function __construct(
+        private readonly array $replicatedTables,
         private readonly HybridLogicalClock $clock = new HybridLogicalClock(),
     ) {}
 
     /**
-     * @param array<string, mixed> $payload a ReplicationCaptureService event payload
+     * @param array<mixed> $payload a ReplicationCaptureService event payload, as received
      */
     public function apply(array $payload, DatabaseAdapterInterface $db): void
     {
-        $table    = (string) $payload['table'];
-        $pkColumn = (string) $payload['pk_column'];
-        $rowKey   = (string) $payload['pk'];
-        /** @var array<string, array{v: mixed, t: string, n: string}> $fields */
-        $fields   = $payload['fields'];
-        $incoming = $fields + [ReplicationCaptureService::EXISTS => $payload['exists']];
+        try {
+            $change = RowChangePayload::fromArray($payload);
+        } catch (\UnexpectedValueException $e) {
+            // Signed by a peer but not a row change: retrying cannot fix it, and
+            // half of it is not applied. Refused here, and the event stays in
+            // the ledger for inspection.
+            StaticLoggerBridge::error('ledger', 'Replicated change refused: malformed payload', ['error' => $e->getMessage()]);
+            return;
+        }
+
+        $table    = $change->table;
+        $pkColumn = $change->pkColumn;
+        $rowKey   = $change->rowKey;
+        /** @var array<string, FieldStamp> $incoming */
+        $incoming = $change->fields + [ReplicationCaptureService::EXISTS => $change->exists];
 
         // A node whose clock runs far ahead would win every conflict for as
         // long as its lead lasted; its changes wait (the caller retries)
         // until this node's own time is within the allowed drift.
-        $this->clock->observe(HlcTimestamp::fromString((string) $payload['hlc']));
+        $this->clock->observe($change->clock);
+
+        // The table and key come off the wire. Only a table this node's own
+        // code marks #[Replicated], keyed by its declared primary key, is
+        // written — a change naming any other table (the clock table, a
+        // permissions table) is refused, whoever signed it.
+        if (($this->replicatedTables[$table] ?? null) !== $pkColumn) {
+            StaticLoggerBridge::error('ledger', 'Replicated change refused: not a #[Replicated] table here', [
+                'table'     => $table,
+                'pk_column' => $pkColumn,
+                'origin'    => $change->node,
+            ]);
+            return;
+        }
 
         $columns = $this->columnsOf($db, $table);
         if ($columns === null) {
-            // A resource this node's code does not have yet. Nothing is stored
-            // for it, so once the node is upgraded a ledger replay applies it.
-            StaticLoggerBridge::warning('ledger', 'Replicated change for a table this node lacks; kept in the ledger only', ['table' => $table]);
+            // Declared but not created yet (the migration has not run). Nothing
+            // is stored for it and nothing is cached, so `ledger:replay` after
+            // the migration applies it.
+            StaticLoggerBridge::warning('ledger', 'Replicated change for a table not created yet; kept in the ledger only', ['table' => $table]);
             return;
         }
 
@@ -66,7 +98,7 @@ final class RowChangeApplier
                 continue; // not here yet; its clock is not stored, so a later replay still applies it
             }
             [$hlc, $node] = $clocks->of($column) ?? [ReplicationCaptureService::ZERO_HLC, ''];
-            if (HlcTimestamp::fromString($field['t'])->wins($field['n'], HlcTimestamp::fromString($hlc), $node)) {
+            if ($field->beats(HlcTimestamp::fromString($hlc), $node)) {
                 $won[$column] = $field;
             }
         }
@@ -76,13 +108,13 @@ final class RowChangeApplier
         }
 
         $exists = isset($won[ReplicationCaptureService::EXISTS])
-            ? (bool) $won[ReplicationCaptureService::EXISTS]['v']
+            ? (bool) $won[ReplicationCaptureService::EXISTS]->value
             : $row !== null;
 
         $values = [];
         foreach ($won as $column => $field) {
             if ($column !== ReplicationCaptureService::EXISTS) {
-                $values[$column] = RowCodec::decodeValue($field['v']);
+                $values[$column] = RowCodec::decodeValue($field->value);
             }
         }
 
@@ -103,11 +135,11 @@ final class RowChangeApplier
             // change itself — whose clocks for them are then the right ones.
             $base = Tombstones::exhume($db, $table, $rowKey);
             $full = [];
-            foreach ($fields as $column => $field) {
+            foreach ($change->fields as $column => $field) {
                 if (in_array($column, $columns, true)) {
                     $full[$column] = array_key_exists($column, $values)
                         ? $values[$column]
-                        : ($base !== null && array_key_exists($column, $base) ? $base[$column] : RowCodec::decodeValue($field['v']));
+                        : ($base !== null && array_key_exists($column, $base) ? $base[$column] : RowCodec::decodeValue($field->value));
                     if ($base === null && !isset($won[$column]) && $clocks->of($column) === null) {
                         $won[$column] = $field;
                     }
@@ -122,22 +154,26 @@ final class RowChangeApplier
             $db,
             $table,
             $rowKey,
-            array_map(static fn (array $field): array => [(string) $field['t'], (string) $field['n']], $won),
+            array_map(static fn (FieldStamp $field): array => [$field->clock->toString(), $field->node], $won),
         );
     }
 
     /** @return list<string>|null */
     private function columnsOf(DatabaseAdapterInterface $db, string $table): ?array
     {
-        if (!array_key_exists($table, $this->columnsByTable)) {
-            $rows = $db->execute(
-                'SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t',
-                ['t' => $table],
-            )->rows;
-            $this->columnsByTable[$table] = $rows === [] ? null : array_map(static fn (array $r): string => (string) $r['name'], $rows);
+        if (isset($this->columnsByTable[$table])) {
+            return $this->columnsByTable[$table];
         }
 
-        return $this->columnsByTable[$table];
+        $rows = $db->execute(
+            'SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t',
+            ['t' => $table],
+        )->rows;
+        if ($rows === []) {
+            return null; // not cached: the migration may create it later
+        }
+
+        return $this->columnsByTable[$table] = array_values(array_map(static fn (array $r): string => Row::of($r)->string('name'), $rows));
     }
 
     /** @return array<string, mixed>|null */

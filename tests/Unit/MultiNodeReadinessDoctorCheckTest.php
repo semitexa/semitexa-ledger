@@ -55,6 +55,15 @@ final class MultiNodeReadinessDoctorCheckTest extends TestCase
     }
 
     #[Test]
+    public function a_redis_on_this_machine_is_a_warning_not_a_pass(): void
+    {
+        $result = MultiNodeReadinessDoctorCheck::assess(['REDIS_HOST' => '127.0.0.1'] + self::READY);
+
+        self::assertSame('warn', $this->statusOf($result));
+        self::assertStringContainsString('REDIS_HOST=127.0.0.1 is this machine', $result->message);
+    }
+
+    #[Test]
     public function shared_sessions_cache_and_storage_pass(): void
     {
         self::assertSame('pass', $this->statusOf(MultiNodeReadinessDoctorCheck::assess(self::READY)));

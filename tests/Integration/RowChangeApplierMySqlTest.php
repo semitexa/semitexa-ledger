@@ -32,14 +32,21 @@ final class RowChangeApplierMySqlTest extends TestCase
     private const TABLE = self::ARTICLES;
     private const ID = '01a0e7a0-0000-7000-8000-000000000001';
 
+    /** The resolver in place before the test — a process-global, put back after. */
+    private ?\Closure $previousResolver;
+
     protected function setUp(): void
     {
+        $this->previousResolver = ReplicationCapture::resolver();
         $this->connectWithReplicationTables();
     }
 
     protected function tearDown(): void
     {
-        ReplicationCapture::setResolver(null);
+        ReplicationCapture::setResolver($this->previousResolver);
+        if (isset($this->db)) {
+            $this->db->execute('DROP TABLE IF EXISTS ledger_it_late'); // before the fixture shuts the ORM down
+        }
         $this->dropReplicationFixture();
     }
 
@@ -156,7 +163,11 @@ final class RowChangeApplierMySqlTest extends TestCase
         $this->applyAll([$event]);
 
         self::assertSame(['id' => self::ID, 'title' => 'T', 'body' => 'B'], $this->row());
-        self::assertSame(0, (int) $this->db->execute("SELECT COUNT(*) AS c FROM replication_field_clock WHERE column_name = 'subtitle'")->rows[0]['c']);
+        self::assertSame(
+            ['__exists', 'body', 'id', 'title'],
+            array_column($this->db->execute('SELECT column_name FROM replication_field_clock WHERE table_name = :t ORDER BY column_name', ['t' => self::TABLE])->rows, 'column_name'),
+            'the clocks of the columns that exist are kept — and only those',
+        );
     }
 
     #[Test]
@@ -167,10 +178,66 @@ final class RowChangeApplierMySqlTest extends TestCase
         $event['hlc'] = (new HlcTimestamp($future, 0))->toString();
 
         $this->expectException(ClockDriftException::class);
-        (new RowChangeApplier())->apply($event, $this->db);
+        $this->applier()->apply($event, $this->db);
+    }
+
+    #[Test]
+    public function a_change_naming_a_table_that_is_not_replicated_here_writes_nothing(): void
+    {
+        $intoClocks = $this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a']);
+        $intoClocks['table'] = 'replication_field_clock';
+        $intoClocks['pk_column'] = 'id';
+
+        $wrongKey = $this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a']);
+        $wrongKey['pk_column'] = 'title';
+
+        $before = (int) $this->db->execute('SELECT COUNT(*) AS c FROM replication_field_clock')->rows[0]['c'];
+        $this->applyAll([$intoClocks, $wrongKey]);
+
+        self::assertNull($this->row());
+        self::assertSame($before, (int) $this->db->execute('SELECT COUNT(*) AS c FROM replication_field_clock')->rows[0]['c']);
+    }
+
+    #[Test]
+    public function a_malformed_change_is_refused_whole_not_half_applied(): void
+    {
+        $valid = $this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a']);
+        $broken = $valid;
+        unset($broken['fields']['body']['t']); // one field without its clock
+
+        $this->applyAll([$broken]);
+        self::assertNull($this->row(), 'no field of a malformed change may be written');
+
+        $this->applyAll([$valid]);
+        self::assertSame(['id' => self::ID, 'title' => 'T', 'body' => 'B'], $this->row());
+    }
+
+    #[Test]
+    public function a_replicated_table_created_after_a_change_arrived_still_receives_it(): void
+    {
+        $applier = new RowChangeApplier(['ledger_it_late' => 'id']);
+        $event = $this->event(['title' => ['T', 100, 'node-a'], 'body' => ['B', 100, 'node-a']], [true, 100, 'node-a']);
+        $event['table'] = 'ledger_it_late';
+
+        $this->db->execute('DROP TABLE IF EXISTS ledger_it_late');
+        $applier->apply($event, $this->db); // before the migration: nothing to write into yet
+
+        $this->db->execute('CREATE TABLE ledger_it_late (id VARCHAR(36) PRIMARY KEY, title VARCHAR(255) NOT NULL, body VARCHAR(255) NOT NULL)');
+        $applier->apply($event, $this->db); // the same worker, after the migration
+
+        self::assertSame(
+            [['id' => self::ID, 'title' => 'T', 'body' => 'B']],
+            $this->db->execute('SELECT id, title, body FROM ledger_it_late')->rows,
+        );
+        $this->db->execute("DELETE FROM replication_field_clock WHERE table_name = 'ledger_it_late'");
     }
 
     // -------------------------------------------------------------------------
+
+    private function applier(): RowChangeApplier
+    {
+        return new RowChangeApplier([self::TABLE => 'id']);
+    }
 
     /**
      * Run $scenario with node $node capturing, and return its outbox payloads.
@@ -179,11 +246,15 @@ final class RowChangeApplierMySqlTest extends TestCase
      */
     private function captureOn(string $node, \Closure $scenario): array
     {
+        $previous = ReplicationCapture::resolver();
         ReplicationCapture::setResolver(static fn (): ReplicationCaptureService => new ReplicationCaptureService($node, new HybridLogicalClock()));
-        $mappers = new MapperRegistry();
-        $mappers->build(mapperClasses: [ReplicatedArticleMapper::class], domainModelClasses: [ReplicatedArticle::class]);
-        $scenario($this->orm->getAggregateWriteEngine(), $mappers);
-        ReplicationCapture::setResolver(null);
+        try {
+            $mappers = new MapperRegistry();
+            $mappers->build(mapperClasses: [ReplicatedArticleMapper::class], domainModelClasses: [ReplicatedArticle::class]);
+            $scenario($this->orm->getAggregateWriteEngine(), $mappers);
+        } finally {
+            ReplicationCapture::setResolver($previous);
+        }
 
         $payloads = array_map(
             static fn (array $r): array => json_decode((string) $r['payload'], true, 512, JSON_THROW_ON_ERROR),
@@ -222,7 +293,7 @@ final class RowChangeApplierMySqlTest extends TestCase
     /** @param list<array<string, mixed>> $events */
     private function applyAll(array $events): void
     {
-        $applier = new RowChangeApplier();
+        $applier = $this->applier();
         foreach ($events as $event) {
             $this->orm->getTransactionManager()->run(static fn (DatabaseAdapterInterface $db) => $applier->apply($event, $db));
         }
