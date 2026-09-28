@@ -132,6 +132,9 @@ final class LedgerPublisher
                 return true; // Done — single successful delivery is sufficient.
 
             } catch (\Throwable $e) {
+                // Re-ensure the stream next time: a failure may mean it was
+                // deleted, and nothing else would ever create it again.
+                unset($this->streamReady[$clusterId]);
                 $this->health->recordFailure($clusterId);
                 StaticLoggerBridge::warning('ledger', 'Publish failed', [
                     'event_id' => $event->eventId,
