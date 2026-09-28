@@ -1,0 +1,136 @@
+# Two independent Semitexa nodes replicating through one NATS JetStream server.
+#
+# Each node is a full app server (Swoole, 4 workers) on the SAME code tree with
+# its OWN MySQL, Redis, ledger file and runtime directories — the shape of two
+# clones on two servers. Driven by run.sh; not part of the dev stack.
+#
+# Networks: each node reaches its own database and Redis over a private
+# network (lan-a / lan-b) and the other node only through NATS on `wan`.
+# Cutting a node off `wan` is a network partition: it keeps serving and
+# writing, and sees nobody.
+#
+#   SEMITEXA_ROOT   the project tree to mount (run.sh sets it)
+#   HARNESS_UID/GID the host user, so nothing written into the tree is root's
+name: semitexa-2node
+
+x-node: &node
+  image: ${HARNESS_IMAGE:-semitexadev-app:latest}
+  user: "${HARNESS_UID:-1000}:${HARNESS_GID:-1000}"
+  working_dir: /var/www/html
+  command: ["php", "-d", "memory_limit=512M", "server.php"]
+  environment: &node-env
+    APP_ENV: dev
+    DB_DRIVER: mysql
+    DB_PORT: "3306"
+    DB_DATABASE: semitexa
+    DB_USERNAME: root
+    DB_PASSWORD: root
+    DB_POOL_SIZE: "8"
+    CACHE_DRIVER: redis
+    REDIS_PORT: "6379"
+    STORAGE_DRIVER: local
+    EVENTS_ASYNC: "1"
+    NATS_URL: nats://nats:4222
+    NATS_PRIMARY_URL: nats://nats:4222
+    LEDGER_ENABLED: "1"
+    LEDGER_HMAC_KEY: two-node-harness-shared-hmac-key-0123456789
+    LEDGER_STREAM: EVENTS_2NODE
+    LEDGER_SUBJECT_PREFIX: semitexa.twonode.events
+    SWOOLE_PORT: "9502"
+    SWOOLE_WORKER_NUM: "4"
+    TENANCY_ENABLED: "0"
+    LLM_BACKEND: ""
+    GEMINI_API_KEY: ""
+    PACKAGIST_API_TOKEN: ""
+
+x-mysql: &mysql
+  image: mysql:8.4
+  environment:
+    MYSQL_ROOT_PASSWORD: root
+    MYSQL_DATABASE: semitexa
+  tmpfs:
+    - /var/lib/mysql
+  healthcheck:
+    # Over TCP: during init the entrypoint runs a temporary server with
+    # networking off, and a socket ping reports healthy before the real one
+    # listens — the nodes then get "connection refused".
+    test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=tcp", "-proot"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+
+# Explicit subnets: a host with many compose projects can run out of Docker's
+# default address pools ("all predefined address pools have been fully
+# subnetted"). Override with HARNESS_NET_PREFIX if 10.201.x collides.
+networks:
+  wan:
+    ipam: { config: [ { subnet: "${HARNESS_NET_PREFIX:-10.201}.1.0/24" } ] }
+  lan-a:
+    ipam: { config: [ { subnet: "${HARNESS_NET_PREFIX:-10.201}.2.0/24" } ] }
+  lan-b:
+    ipam: { config: [ { subnet: "${HARNESS_NET_PREFIX:-10.201}.3.0/24" } ] }
+
+services:
+  nats:
+    image: nats:2.12
+    command: ["--jetstream"]
+    networks: [wan]
+
+  mysql-a:
+    <<: *mysql
+    networks: [lan-a]
+  mysql-b:
+    <<: *mysql
+    networks: [lan-b]
+
+  redis-a:
+    image: redis:7-alpine
+    networks: [lan-a]
+  redis-b:
+    image: redis:7-alpine
+    networks: [lan-b]
+
+  node-a:
+    <<: *node
+    depends_on:
+      mysql-a: { condition: service_healthy }
+      nats: { condition: service_started }
+    networks: [wan, lan-a]
+    environment:
+      <<: *node-env
+      DB_HOST: mysql-a
+      REDIS_HOST: redis-a
+      LEDGER_NODE_ID: node-a
+      LEDGER_DB_PATH: /tmp/ledger/node-a.sqlite
+      SWOOLE_LOG_FILE: /tmp/swoole-node-a.log
+    volumes: &node-volumes
+      - ${SEMITEXA_ROOT:?set SEMITEXA_ROOT}:/var/www/html
+      # A replicated resource + a CLI to write it, present only in the nodes.
+      - ./module/ReplicationHarness:/var/www/html/src/modules/ReplicationHarness:ro
+    tmpfs: &node-tmpfs
+      # Per node, so two servers never share a pid file, and the harness never
+      # writes into the dev tree's logs or its schema-migration history.
+      - /var/www/html/var/run:uid=${HARNESS_UID:-1000},gid=${HARNESS_GID:-1000}
+      - /var/www/html/var/log:uid=${HARNESS_UID:-1000},gid=${HARNESS_GID:-1000}
+      - /var/www/html/var/migrations:uid=${HARNESS_UID:-1000},gid=${HARNESS_GID:-1000}
+      - /tmp:uid=${HARNESS_UID:-1000},gid=${HARNESS_GID:-1000}
+    ports:
+      - "127.0.0.1:${NODE_A_PORT:-9591}:9502"
+
+  node-b:
+    <<: *node
+    depends_on:
+      mysql-b: { condition: service_healthy }
+      nats: { condition: service_started }
+    networks: [wan, lan-b]
+    environment:
+      <<: *node-env
+      DB_HOST: mysql-b
+      REDIS_HOST: redis-b
+      LEDGER_NODE_ID: node-b
+      LEDGER_DB_PATH: /tmp/ledger/node-b.sqlite
+      SWOOLE_LOG_FILE: /tmp/swoole-node-b.log
+    volumes: *node-volumes
+    tmpfs: *node-tmpfs
+    ports:
+      - "127.0.0.1:${NODE_B_PORT:-9592}:9502"

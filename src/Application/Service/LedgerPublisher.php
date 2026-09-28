@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\EventStream;
 
 /**
  * Background Swoole coroutine that publishes pending local events to NATS.
@@ -18,7 +20,8 @@ use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
  *
  * Retry strategy:
  *  - 0.5 s poll when there are pending events (aggressive — propagation matters).
- *  - 5.0 s poll when the ledger is empty.
+ *  - 1.0 s poll when the ledger is empty — the check is one indexed query on
+ *    local SQLite, and a peer waiting on a change should not wait 5 s for it.
  *  - No exponential backoff: the ledger is durable; retrying fast is correct.
  *
  * Cluster selection: primary-first. Falls back to secondary on failure.
@@ -31,7 +34,7 @@ use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 final class LedgerPublisher
 {
     private const BATCH_SIZE = 100;
-    private const IDLE_SLEEP = 5.0;
+    private const IDLE_SLEEP = 1.0;
     private const BUSY_SLEEP = 0.5;
 
     public function __construct(
@@ -39,7 +42,11 @@ final class LedgerPublisher
         private readonly string $nodeId,
         private readonly ClusterRegistry $clusters,
         private readonly ClusterHealthTracker $health,
+        private readonly EventStream $stream = new EventStream(),
     ) {}
+
+    /** @var array<string, true> clusters whose event stream is known to exist */
+    private array $streamReady = [];
 
     /**
      * Run indefinitely. Call from a dedicated Swoole coroutine.
@@ -58,7 +65,7 @@ final class LedgerPublisher
                 // reported as standing by design. Raised in review of core#135.
                 $published = StandingCoroutines::busy(fn (): int => $this->publishBatch());
             } catch (\Throwable $e) {
-                error_log('[semitexa-ledger] LedgerPublisher error: ' . $e->getMessage());
+                StaticLoggerBridge::error('ledger', 'Publisher batch failed', ['error' => $e->getMessage()]);
                 $published = 0;
             }
 
@@ -67,7 +74,8 @@ final class LedgerPublisher
     }
 
     /**
-     * Publish one batch of pending events. Returns the number published.
+     * Publish one batch of pending events, in sequence order. Returns the
+     * number published.
      */
     public function publishBatch(): int
     {
@@ -78,25 +86,26 @@ final class LedgerPublisher
              LIMIT " . self::BATCH_SIZE
         );
 
+        $published = 0;
         foreach ($rows as $row) {
-            $this->publishToAnyCluster(LedgerEvent::fromRow($row));
+            // Stop at the first event no cluster took: publishing its successors
+            // would reach peers as a sequence gap they can only refuse and wait on.
+            if (!$this->publishToAnyCluster(LedgerEvent::fromRow($row))) {
+                break;
+            }
+            $published++;
         }
 
-        return count($rows);
+        return $published;
     }
 
     // -------------------------------------------------------------------------
     // Internals
     // -------------------------------------------------------------------------
 
-    private function publishToAnyCluster(LedgerEvent $event): void
+    private function publishToAnyCluster(LedgerEvent $event): bool
     {
-        $subject = sprintf(
-            'semitexa.events.%s.%s.%s',
-            $event->originNode,
-            $event->domain,
-            $event->eventType,
-        );
+        $subject = $this->stream->subjectFor($event);
 
         $payload = $event->toJson();
         $headers = ['Nats-Msg-Id' => $event->eventId];
@@ -110,28 +119,39 @@ final class LedgerPublisher
             }
 
             try {
-                $client->jetStreamPublish($subject, $payload, $headers);
+                if (!isset($this->streamReady[$clusterId])) {
+                    $this->stream->ensure($client);
+                    $this->streamReady[$clusterId] = true;
+                }
 
-                $this->markPublished($event->eventId, $clusterId);
+                // Returns only once the stream has stored it — an event is
+                // never marked published on a send nothing captured.
+                $natsSequence = $client->jetStreamPublish($subject, $payload, $headers);
+
+                $this->markPublished($event->eventId, $clusterId, $natsSequence);
                 $this->health->recordSuccess($clusterId);
-                return; // Done — single successful delivery is sufficient.
+                return true; // Done — single successful delivery is sufficient.
 
             } catch (\Throwable $e) {
+                // Re-ensure the stream next time: a failure may mean it was
+                // deleted, and nothing else would ever create it again.
+                unset($this->streamReady[$clusterId]);
+                $client->reconnect();
                 $this->health->recordFailure($clusterId);
-                error_log(sprintf(
-                    '[semitexa-ledger] Publish failed for event %s on cluster %s: %s',
-                    $event->eventId,
-                    $clusterId,
-                    $e->getMessage(),
-                ));
+                StaticLoggerBridge::warning('ledger', 'Publish failed', [
+                    'event_id' => $event->eventId,
+                    'cluster'  => $clusterId,
+                    'error'    => $e->getMessage(),
+                ]);
                 // Fall through to next cluster.
             }
         }
 
         // All clusters failed — event remains 'pending' and will be retried.
+        return false;
     }
 
-    private function markPublished(string $eventId, string $clusterId): void
+    private function markPublished(string $eventId, string $clusterId, int $natsSequence): void
     {
         $now = gmdate('Y-m-d\TH:i:s\Z');
 
@@ -141,9 +161,9 @@ final class LedgerPublisher
         );
 
         $this->db->execute(
-            'INSERT OR IGNORE INTO publish_log (event_id, cluster_id, published_at)
-             VALUES (:event_id, :cluster_id, :now)',
-            ['event_id' => $eventId, 'cluster_id' => $clusterId, 'now' => $now]
+            'INSERT OR IGNORE INTO publish_log (event_id, cluster_id, nats_sequence, published_at)
+             VALUES (:event_id, :cluster_id, :seq, :now)',
+            ['event_id' => $eventId, 'cluster_id' => $clusterId, 'seq' => $natsSequence, 'now' => $now]
         );
     }
 }

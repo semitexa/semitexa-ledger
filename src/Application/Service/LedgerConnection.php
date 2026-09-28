@@ -34,12 +34,15 @@ final class LedgerConnection
         $this->db = new \SQLite3($dbPath);
         $this->db->enableExceptions(true);
 
+        // 5 s wait before returning SQLITE_BUSY — FIRST. Every worker opens the
+        // same file at boot, and switching a fresh file to WAL needs a write
+        // lock: with no busy timeout yet, the workers that lost that race threw
+        // "database is locked" and died at boot (two-node harness, 2026-09-28).
+        $this->db->busyTimeout(5000);
         // WAL for concurrent reads alongside writes.
         $this->db->exec('PRAGMA journal_mode = WAL');
         // Balance durability vs. throughput (fsync on checkpoints, not every write).
         $this->db->exec('PRAGMA synchronous = NORMAL');
-        // 5 s wait before returning SQLITE_BUSY.
-        $this->db->exec('PRAGMA busy_timeout = 5000');
         // 64 MB in-process page cache.
         $this->db->exec('PRAGMA cache_size = -64000');
         // WAL checkpoint every 1000 pages.

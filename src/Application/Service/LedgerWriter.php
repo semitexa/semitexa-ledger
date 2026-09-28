@@ -59,17 +59,52 @@ final class LedgerWriter
             return null;
         }
 
+        // The payload is read through getters. An event that carries its data
+        // in public (readonly) properties serialises to [] — and every peer
+        // would replay an event with no data in it. Refuse it here, loudly.
+        if ($payload === [] && (new \ReflectionClass($eventClass))->getProperties() !== []) {
+            throw new \LogicException(
+                "Propagated event {$eventClass} serialised to an empty payload: expose its data through " .
+                'get*() getters (with matching set*() setters for replay), not public properties.'
+            );
+        }
+
         $domain    = $propagated->domain ?? $this->deriveDomain($eventClass);
         $eventType = $this->deriveEventType($eventClass);
         [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);
 
-        $now       = $this->nowMicros();
-        $eventId   = UuidV7::generate();
-        $metadata  = ['timestamp' => $now, 'node_id' => $this->nodeId];
+        return $this->appendRecord(UuidV7::generate(), $domain, $eventType, $payload, $aggregateType, $aggregateId);
+    }
+
+    /**
+     * Append an event built elsewhere, under a caller-chosen id.
+     *
+     * Idempotent on $eventId: appending an id the ledger already holds returns
+     * the stored event and writes nothing. The replication relay relies on
+     * this — it appends, then deletes its outbox row, and a crash in between
+     * makes it append the same id again.
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function appendRecord(
+        string $eventId,
+        string $domain,
+        string $eventType,
+        array $payload,
+        ?string $aggregateType = null,
+        ?string $aggregateId = null,
+    ): LedgerEvent {
+        $now      = $this->nowMicros();
+        $metadata = ['timestamp' => $now, 'node_id' => $this->nodeId];
 
         $ledgerEvent = $this->db->transaction(function (LedgerConnection $db) use (
             $aggregateId, $aggregateType, $eventId, $domain, $eventType, $payload, $metadata, $now
         ): LedgerEvent {
+            $existing = $db->fetchOne('SELECT * FROM events WHERE event_id = :id', ['id' => $eventId]);
+            if ($existing !== null) {
+                return LedgerEvent::fromRow($existing);
+            }
+
             // Increment per-origin sequence and fetch previous hash.
             [$sequence, $prevHash] = $this->nextSequenceAndHash($db);
 

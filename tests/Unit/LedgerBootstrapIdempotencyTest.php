@@ -84,7 +84,21 @@ final class LedgerBootstrapIdempotencyTest extends TestCase
         $bootstrap->handle($this->context(container: null));
     }
 
-    private function context(?object $container = null): ServerLifecycleContext
+    #[Test]
+    public function only_worker_zero_runs_the_background_loops(): void
+    {
+        // Every worker used to start its own publisher, replayer and command
+        // listener: N replayers split the node's durable consumer between them
+        // and naked each other's events as sequence gaps.
+        $bootstrap = new CountingLedgerBootstrap();
+
+        self::assertTrue($bootstrap->ownsLoops($this->context(workerId: 0)));
+        self::assertFalse($bootstrap->ownsLoops($this->context(workerId: 1)));
+        self::assertFalse($bootstrap->ownsLoops($this->context(workerId: 7)));
+        self::assertFalse($bootstrap->ownsLoops($this->context(workerId: null)));
+    }
+
+    private function context(?object $container = null, ?int $workerId = null): ServerLifecycleContext
     {
         // boot() is overridden in the guard tests to ignore the context; for the
         // real-boot test we set `container` explicitly. Building via reflection
@@ -92,6 +106,7 @@ final class LedgerBootstrapIdempotencyTest extends TestCase
         $ctx = (new \ReflectionClass(ServerLifecycleContext::class))->newInstanceWithoutConstructor();
         $prop = new \ReflectionProperty(ServerLifecycleContext::class, 'container');
         $prop->setValue($ctx, $container);
+        (new \ReflectionProperty(ServerLifecycleContext::class, 'workerId'))->setValue($ctx, $workerId);
 
         return $ctx;
     }
@@ -104,5 +119,10 @@ final class CountingLedgerBootstrap extends LedgerBootstrap
     protected function boot(ServerLifecycleContext $context): void
     {
         $this->bootCount++;
+    }
+
+    public function ownsLoops(ServerLifecycleContext $context): bool
+    {
+        return $this->ownsBackgroundLoops($context);
     }
 }
