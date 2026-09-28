@@ -71,6 +71,12 @@ final class ReplicationCaptureService implements ReplicationCaptureInterface
 
         FieldClocks::write($transaction, $change->tableName, $key, $changed, $stamp, $this->nodeId);
 
+        // A hard delete keeps the row's last values: if a later write from
+        // another node brings the row back, it is rebuilt from them.
+        if ($change->after === null && $change->before !== null) {
+            Tombstones::bury($transaction, $change->tableName, $key, $change->before);
+        }
+
         $transaction->execute(
             'INSERT INTO replication_outbox (event_id, payload, created_at) VALUES (:event_id, :payload, :created_at)',
             [
@@ -114,6 +120,8 @@ final class ReplicationCaptureService implements ReplicationCaptureInterface
             }
         }
 
-        return $changed;
+        // A write says the row exists: a delete elsewhere that is older than
+        // this edit must not win over it (ADR 0001: a later write resurrects).
+        return $changed === [] ? [] : [...$changed, self::EXISTS];
     }
 }

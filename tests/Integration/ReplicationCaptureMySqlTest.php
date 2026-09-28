@@ -21,7 +21,6 @@ use Semitexa\Ledger\Tests\Integration\Fixture\ReplicatedArticleResourceModel;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Application\Service\Mapping\MapperRegistry;
 use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
-use Semitexa\Orm\OrmManager;
 
 /**
  * A write to a #[Replicated] resource, through the real ORM engine on MySQL,
@@ -30,36 +29,15 @@ use Semitexa\Orm\OrmManager;
  */
 final class ReplicationCaptureMySqlTest extends TestCase
 {
-    private const TABLE = 'ledger_it_articles';
+    use RequiresReplicationTables;
 
-    private OrmManager $orm;
-    private DatabaseAdapterInterface $db;
+    private const TABLE = self::ARTICLES;
+
     private string $ledgerFile;
 
     protected function setUp(): void
     {
-        try {
-            $this->orm = new OrmManager();
-            if ($this->orm->getDriver() !== 'mysql') {
-                throw new \RuntimeException('replication capture needs MySQL');
-            }
-            $this->db = $this->orm->getAdapter();
-            $this->db->execute('SELECT 1');
-        } catch (\Throwable $e) {
-            self::markTestSkipped('MySQL unavailable: ' . $e->getMessage());
-        }
-
-        $this->db->execute('CREATE TABLE IF NOT EXISTS ' . self::TABLE . ' (id CHAR(36) PRIMARY KEY, title VARCHAR(255) NOT NULL, body VARCHAR(255) NOT NULL)');
-        $this->db->execute(
-            'CREATE TABLE IF NOT EXISTS replication_field_clock (id BIGINT AUTO_INCREMENT PRIMARY KEY, table_name VARCHAR(64) NOT NULL, '
-            . 'row_pk VARCHAR(191) NOT NULL, column_name VARCHAR(64) NOT NULL, hlc CHAR(20) NOT NULL, node VARCHAR(64) NOT NULL, '
-            . 'UNIQUE KEY uniq_replication_field_clock (table_name, row_pk, column_name))'
-        );
-        $this->db->execute(
-            'CREATE TABLE IF NOT EXISTS replication_outbox (id BIGINT AUTO_INCREMENT PRIMARY KEY, event_id CHAR(36) NOT NULL, '
-            . 'payload LONGTEXT NOT NULL, created_at DATETIME NOT NULL, UNIQUE KEY uniq_replication_outbox_event (event_id))'
-        );
-        $this->clean();
+        $this->connectWithReplicationTables();
 
         ReplicationCapture::setResolver(static fn (): ReplicationCaptureService => new ReplicationCaptureService('node-a', new HybridLogicalClock()));
         $this->ledgerFile = sys_get_temp_dir() . '/ledger-capture-' . bin2hex(random_bytes(4)) . '.sqlite';
@@ -68,11 +46,7 @@ final class ReplicationCaptureMySqlTest extends TestCase
     protected function tearDown(): void
     {
         ReplicationCapture::setResolver(null);
-        if (isset($this->db)) {
-            $this->clean();
-            $this->db->execute('DROP TABLE IF EXISTS ' . self::TABLE);
-            $this->orm->shutdown();
-        }
+        $this->dropReplicationFixture();
         foreach (isset($this->ledgerFile) ? [$this->ledgerFile, "{$this->ledgerFile}-wal", "{$this->ledgerFile}-shm"] : [] as $f) {
             if (is_file($f)) {
                 unlink($f);
@@ -104,7 +78,7 @@ final class ReplicationCaptureMySqlTest extends TestCase
         self::assertSame('second body', $update['fields']['body']['v']);
         self::assertSame($update['hlc'], $update['fields']['body']['t']);
         self::assertSame($insert['hlc'], $update['fields']['title']['t'], 'an unchanged field keeps its clock');
-        self::assertSame($insert['hlc'], $update['exists']['t']);
+        self::assertSame($update['hlc'], $update['exists']['t'], 'a write re-asserts that the row exists');
 
         // Delete: a tombstone, stamped later still, carrying the last state.
         self::assertFalse($delete['exists']['v']);
@@ -194,12 +168,5 @@ final class ReplicationCaptureMySqlTest extends TestCase
         $registry->build(mapperClasses: [ReplicatedArticleMapper::class], domainModelClasses: [ReplicatedArticle::class]);
 
         return $registry;
-    }
-
-    private function clean(): void
-    {
-        $this->db->execute('DELETE FROM replication_field_clock WHERE table_name = :t', ['t' => self::TABLE]);
-        $this->db->execute('DELETE FROM replication_outbox');
-        $this->db->execute('DELETE FROM ' . self::TABLE);
     }
 }

@@ -23,6 +23,7 @@ use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 use Semitexa\Ledger\Application\Service\Nats\EventStream;
 use Semitexa\Ledger\Application\Service\Replication\ReplicationCaptureService;
 use Semitexa\Ledger\Application\Service\Replication\ReplicationRelay;
+use Semitexa\Ledger\Application\Service\Replication\RowChangedReplayHandler;
 use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 use Semitexa\Ledger\Application\Service\OwnershipCache;
@@ -180,6 +181,9 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         );
 
         if ($this->ownsBackgroundLoops($context)) {
+            $rowChanges = new RowChangedReplayHandler(
+                static fn (callable $work): mixed => $connectionRegistry->manager($dbConnection)->getTransactionManager()->run($work),
+            );
             $relay = new ReplicationRelay(
                 $writer,
                 static fn (): \Semitexa\Orm\Adapter\DatabaseAdapterInterface => $connectionRegistry->manager($dbConnection)->getAdapter(),
@@ -194,7 +198,11 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
                 $handlerRegistry,
                 $ownership,
                 $commandRegistry,
-                static fn (string $class): object => $container->resolve($class),
+                // The row-change handler needs the application database's
+                // transactions, which the container cannot hand a constructor.
+                static fn (string $class): object => $class === RowChangedReplayHandler::class
+                    ? $rowChanges
+                    : $container->resolve($class),
             );
         }
 
