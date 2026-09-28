@@ -21,6 +21,9 @@ use Semitexa\Ledger\Application\Service\ReplayHandlerRegistry;
 use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 use Semitexa\Ledger\Application\Service\Nats\EventStream;
+use Semitexa\Ledger\Application\Service\Replication\ReplicationCaptureService;
+use Semitexa\Ledger\Application\Service\Replication\ReplicationRelay;
+use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 use Semitexa\Ledger\Application\Service\OwnershipCache;
 use Semitexa\Ledger\Application\Service\Queue\DualWriteTransport;
@@ -166,12 +169,23 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         $dispatcher = $container->get(EventDispatcher::class);
         $dispatcher->addPostDispatchHook(new LedgerDispatchHook($writer->append(...)));
 
+        // Writes to #[Replicated] resources are captured in their own
+        // transaction (ADR 0001). Every worker writes, so every worker captures.
+        $capture = new ReplicationCaptureService($nodeId, new HybridLogicalClock());
+        ReplicationCapture::setResolver(static fn (): ReplicationCaptureService => $capture);
+
         // 5-7. Background loops: publisher, replayer, command listener.
         $commandRegistry = new CommandRegistry(
             $container->get(\Semitexa\Core\Discovery\ClassDiscovery::class),
         );
 
         if ($this->ownsBackgroundLoops($context)) {
+            $relay = new ReplicationRelay(
+                $writer,
+                static fn (): \Semitexa\Orm\Adapter\DatabaseAdapterInterface => $connectionRegistry->manager($dbConnection)->getAdapter(),
+            );
+            \Swoole\Coroutine::create(static fn () => $relay->run());
+
             $this->startBackgroundLoops(
                 $db,
                 $nodeId,
@@ -254,14 +268,24 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
 
     private function shouldBootLedger(): bool
     {
+        return self::isEnabled();
+    }
+
+    /**
+     * Whether this process runs as a ledger node. Shared with the console
+     * wiring, so a command and a worker never disagree about it.
+     */
+    public static function isEnabled(): bool
+    {
         $enabled = getenv('LEDGER_ENABLED');
 
         if ($enabled !== false && $enabled !== '') {
-            if ($this->isTruthy($enabled)) {
+            $normalized = strtolower(trim($enabled));
+            if (in_array($normalized, ['1', 'true', 'yes', 'on'], true)) {
                 return true;
             }
 
-            if ($this->isFalsy($enabled)) {
+            if (in_array($normalized, ['0', 'false', 'no', 'off'], true)) {
                 return false;
             }
         }
@@ -280,16 +304,6 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
             );
         }
         return $value;
-    }
-
-    private function isTruthy(string $value): bool
-    {
-        return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
-    }
-
-    private function isFalsy(string $value): bool
-    {
-        return in_array(strtolower(trim($value)), ['0', 'false', 'no', 'off'], true);
     }
 
     private function ensureDir(string $dbPath): void
