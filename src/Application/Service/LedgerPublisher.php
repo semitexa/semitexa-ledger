@@ -20,7 +20,8 @@ use Semitexa\Ledger\Application\Service\Nats\EventStream;
  *
  * Retry strategy:
  *  - 0.5 s poll when there are pending events (aggressive — propagation matters).
- *  - 5.0 s poll when the ledger is empty.
+ *  - 1.0 s poll when the ledger is empty — the check is one indexed query on
+ *    local SQLite, and a peer waiting on a change should not wait 5 s for it.
  *  - No exponential backoff: the ledger is durable; retrying fast is correct.
  *
  * Cluster selection: primary-first. Falls back to secondary on failure.
@@ -33,7 +34,7 @@ use Semitexa\Ledger\Application\Service\Nats\EventStream;
 final class LedgerPublisher
 {
     private const BATCH_SIZE = 100;
-    private const IDLE_SLEEP = 5.0;
+    private const IDLE_SLEEP = 1.0;
     private const BUSY_SLEEP = 0.5;
 
     public function __construct(
