@@ -12,7 +12,8 @@
     "require": {
         "php": "^8.4",
         "ext-sqlite3": "*",
-        "semitexa/core": ">=2026.09.13.0749 || dev-master",
+        "semitexa/core": ">=2026.09.13.1330 || dev-master",
+        "semitexa/orm": "*",
         "basis-company/nats": "^1.1"
     },
     "autoload": {
@@ -28,6 +29,11 @@
     "extra": {
         "semitexa-module": {
             "extends": null
+        },
+        "semitexa": {
+            "floors": {
+                "semitexa/orm": "next"
+            }
         }
     },
     "keywords": [

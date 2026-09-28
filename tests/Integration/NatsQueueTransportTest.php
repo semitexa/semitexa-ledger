@@ -115,6 +115,42 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(0, $this->pendingAcks());
     }
 
+    #[Test]
+    public function a_queue_consumer_made_before_acks_moved_is_brought_to_the_new_settings(): void
+    {
+        $settings = null;
+        $failure = null;
+
+        Coroutine\run(function () use (&$settings, &$failure): void {
+            try {
+                $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $client->ensureStream('QUEUE', ['subjects' => ['semitexa.queue.>']]);
+                // As an earlier release left it: server defaults (30 s, unlimited).
+                $client->ensurePullConsumer('QUEUE', NatsTransport::consumerName($this->queue), 'semitexa.queue.' . $this->queue);
+                $before = [
+                    $client->consumerSetting('QUEUE', NatsTransport::consumerName($this->queue), 'ack_wait'),
+                    $client->consumerSetting('QUEUE', NatsTransport::consumerName($this->queue), 'max_deliver'),
+                ];
+
+                $this->transport()->consumeBatch($this->queue, static function (): void {});
+
+                $settings = [$before, [
+                    $client->consumerSetting('QUEUE', NatsTransport::consumerName($this->queue), 'ack_wait'),
+                    $client->consumerSetting('QUEUE', NatsTransport::consumerName($this->queue), 'max_deliver'),
+                ]];
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame([30_000_000_000, -1], $settings[0], 'the starting point must be the old defaults');
+        self::assertSame([300_000_000_000, 5], $settings[1]);
+    }
+
     private function pendingAcks(): int
     {
         $pending = null;
