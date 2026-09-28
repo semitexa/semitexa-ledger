@@ -4,33 +4,47 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Support\StandingCoroutines;
-use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\EventStream;
+use Semitexa\Ledger\Application\Service\Nats\NatsClient;
+use Semitexa\Ledger\Application\Service\Nats\PulledMessage;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 
 /**
- * Background Swoole coroutine that consumes events from NATS and applies them
- * to the local ledger + main database.
+ * Consumes events other nodes published and applies them to this node's
+ * ledger + main database.
  *
- * Runs one consumer loop per cluster (each in its own coroutine).
- * Both loops feed into the same deduplication + apply pipeline.
+ * Runs one consumer loop per cluster (each in its own coroutine), in ONE worker
+ * per node — see LedgerBootstrap. Both loops feed the same deduplication +
+ * apply pipeline.
  *
- * Deduplication layers:
- *  1. origin_node == self    → skip (own events already in ledger).
- *  2. SQLite INSERT OR IGNORE on event_id → duplicate delivery from either cluster.
- *  3. Sequence gap detection → NAK and wait (origin's publisher will fill the gap).
- *
- * Hash chain and HMAC verification are performed before DB write.
- * Mismatches go to the quarantine table and are never applied.
+ * Every message is acked or naked explicitly, and only after its outcome is
+ * durable:
+ *  1. origin_node == self        → ack (own events already in ledger).
+ *  2. event_id already in ledger → ack, but first re-apply it if it was stored
+ *                                  and never applied (a handler failed).
+ *  3. Sequence gap               → nak with a delay; the missing predecessor is
+ *                                  in the stream and arrives first on redelivery.
+ *  4. Hash chain / HMAC mismatch → quarantine, ack. Never applied.
+ *  5. Apply failure              → nak with a delay; the stored row carries no
+ *                                  applied_at, so step 2 retries it.
  */
 final class LedgerReplayer
 {
-    private const STREAM_NAME = 'EVENTS';
     private const PULL_BATCH  = 50;
-    private const PULL_SLEEP  = 1.0;  // seconds between empty polls
+    private const PULL_WAIT   = 1.0;  // seconds the server holds an empty pull open
+    private const ERROR_SLEEP = 1.0;  // seconds after a failed pull
+    private const RETRY_DELAY = 1.0;  // seconds before a naked message returns
 
+    /** @var array<string, true> clusters whose stream + consumer are known to exist */
+    private array $consumerReady = [];
+
+    /**
+     * @param \Closure(class-string): object $resolveHandler builds a replay handler instance
+     */
     public function __construct(
         private readonly LedgerConnection $db,
         private readonly string $nodeId,
@@ -38,11 +52,13 @@ final class LedgerReplayer
         private readonly ClusterRegistry $clusters,
         private readonly ReplayHandlerRegistry $handlerRegistry,
         private readonly AggregateOwnershipService $ownership,
+        private readonly \Closure $resolveHandler,
+        private readonly EventStream $stream = new EventStream(),
     ) {}
 
     /**
      * Start one consumer coroutine per cluster.
-     * Call from the server's worker-start lifecycle hook.
+     * Call once per node, from the worker that owns the background loops.
      */
     public function start(): void
     {
@@ -51,29 +67,51 @@ final class LedgerReplayer
             $client    = $entry['client'];
 
             \Swoole\Coroutine::create(function () use ($clusterId, $client): void {
-                $consumerName = "node-{$this->nodeId}";
-                $lastSeq      = $this->getLastNatsSequence($consumerName, $clusterId);
-
-                $client->ensurePullConsumer(
-                    streamName:     self::STREAM_NAME,
-                    consumerName:   $consumerName,
-                    filterSubject:  'semitexa.events.>',
-                    startSequence:  $lastSeq,
-                );
-
-                $this->runConsumeLoop($client, $consumerName, $clusterId);
+                $this->runConsumeLoop($client, $clusterId);
             });
         }
     }
 
     /**
-     * Single-cluster consume loop. Runs indefinitely.
+     * Pull one batch from one cluster and process it. Returns how many messages
+     * arrived. The consume loop is this in a loop; tests drive it directly.
      */
-    private function runConsumeLoop(
-        \Semitexa\Ledger\Application\Service\Nats\NatsClient $client,
-        string $consumerName,
-        string $clusterId,
-    ): void {
+    public function pullAndProcess(NatsClient $client, string $clusterId): int
+    {
+        $consumerName = $this->consumerName();
+
+        if (!isset($this->consumerReady[$clusterId])) {
+            // Inside the caller's error handling: an unreachable cluster at boot
+            // used to kill the coroutine for good, because this ran before the
+            // loop's try/catch.
+            $this->stream->ensure($client);
+
+            $lastSeq = $this->getLastNatsSequence($consumerName, $clusterId);
+            $client->ensurePullConsumer(
+                streamName:    $this->stream->name,
+                consumerName:  $consumerName,
+                filterSubject: $this->stream->filterSubject(),
+                startSequence: $lastSeq > 0 ? $lastSeq + 1 : 0,
+            );
+            $this->consumerReady[$clusterId] = true;
+        }
+
+        $messages = $client->pullMessages(
+            streamName:   $this->stream->name,
+            consumerName: $consumerName,
+            batchSize:    self::PULL_BATCH,
+            waitSeconds:  self::PULL_WAIT,
+        );
+
+        foreach ($messages as $msg) {
+            $this->processMessage($msg, $clusterId);
+        }
+
+        return count($messages);
+    }
+
+    private function runConsumeLoop(NatsClient $client, string $clusterId): void
+    {
         StandingCoroutines::declare(
             'ledger replayer',
             'pulling from cluster ' . $clusterId . ' — parks between pulls, by design',
@@ -81,68 +119,58 @@ final class LedgerReplayer
 
         while (true) {
             try {
-                $messages = $client->pullMessages(
-                    streamName:   self::STREAM_NAME,
-                    consumerName: $consumerName,
-                    batchSize:    self::PULL_BATCH,
-                );
-
-                // The pull above is the park the label describes; handling
-                // what it returned is not, and a message that wedges the
-                // replayer must not read as standing by design. Raised in
-                // review of core#135.
-                StandingCoroutines::busy(function () use ($messages, $clusterId, $consumerName): void {
-                    foreach ($messages as $msg) {
-                        $this->processMessage((string) $msg->body, $clusterId, $consumerName, $msg);
-                    }
-                });
-
-                if (empty($messages)) {
-                    \Swoole\Coroutine::sleep(self::PULL_SLEEP);
-                }
+                // The pull holds the server-side wait (PULL_WAIT) — that is the
+                // park the label describes. Handling what it returned is not,
+                // and a message that wedges the replayer must not read as
+                // standing by design. Raised in review of core#135.
+                StandingCoroutines::busy(fn (): int => $this->pullAndProcess($client, $clusterId));
             } catch (\Throwable $e) {
-                error_log("[semitexa-ledger] LedgerReplayer error (cluster={$clusterId}): " . $e->getMessage());
-                \Swoole\Coroutine::sleep(self::PULL_SLEEP);
+                unset($this->consumerReady[$clusterId]);
+                StaticLoggerBridge::error('ledger', 'Replayer pull failed', ['cluster' => $clusterId, 'error' => $e->getMessage()]);
+                \Swoole\Coroutine::sleep(self::ERROR_SLEEP);
             }
         }
+    }
+
+    private function consumerName(): string
+    {
+        return "node-{$this->nodeId}";
     }
 
     // -------------------------------------------------------------------------
     // Per-message pipeline
     // -------------------------------------------------------------------------
 
-    private function processMessage(
-        string $rawPayload,
-        string $sourceCluster,
-        string $consumerName,
-        object $msg,
-    ): void {
+    private function processMessage(PulledMessage $msg, string $sourceCluster): void
+    {
         try {
-            $event = LedgerEvent::fromJson($rawPayload);
+            $event = LedgerEvent::fromJson($msg->body);
         } catch (\Throwable) {
             // Malformed envelope — cannot process; ACK to prevent redelivery loop.
-            $msg->ack();
-            error_log("[semitexa-ledger] Malformed event payload from cluster={$sourceCluster}");
+            $this->ack($msg, $sourceCluster, null);
+            StaticLoggerBridge::error('ledger', 'Malformed event payload dropped', ['cluster' => $sourceCluster]);
             return;
         }
 
         // Skip own events (already in ledger from LedgerWriter).
         if ($event->originNode === $this->nodeId) {
-            $msg->ack();
+            $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
 
         // Duplicate check by event_id.
         $existing = $this->db->fetchOne(
-            'SELECT hash FROM events WHERE event_id = :id',
+            'SELECT hash, applied_at FROM events WHERE event_id = :id',
             ['id' => $event->eventId]
         );
 
         if ($existing !== null) {
             if ($existing['hash'] !== $event->hash) {
                 $this->quarantine($event, (string) $existing['hash'], $sourceCluster);
+            } elseif ($existing['applied_at'] === null && !$this->applyAndMark($event, $msg)) {
+                return; // naked — the next delivery retries the apply
             }
-            $msg->ack();
+            $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
 
@@ -159,17 +187,18 @@ final class LedgerReplayer
 
         if ($event->sequence < $expectedSeq) {
             // Old event — duplicate delivery path we missed above; safe to ACK.
-            $msg->ack();
+            $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
 
         if ($event->sequence > $expectedSeq) {
-            // Gap detected — NAK so JetStream redelivers later.
-            $msg->nak();
-            error_log(sprintf(
-                '[semitexa-ledger] Sequence gap for origin=%s: expected=%d got=%d',
-                $event->originNode, $expectedSeq, $event->sequence,
-            ));
+            // Gap detected — NAK so JetStream redelivers once the predecessor landed.
+            $msg->nak(self::RETRY_DELAY);
+            StaticLoggerBridge::warning('ledger', 'Sequence gap, waiting for predecessor', [
+                'origin'   => $event->originNode,
+                'expected' => $expectedSeq,
+                'got'      => $event->sequence,
+            ]);
             return;
         }
 
@@ -177,7 +206,7 @@ final class LedgerReplayer
         $expectedChainHash = hash('sha256', $expectedHash . $event->eventId . json_encode($event->payload, JSON_THROW_ON_ERROR));
         if ($event->hash !== $expectedChainHash) {
             $this->quarantine($event, $expectedChainHash, $sourceCluster);
-            $msg->ack();
+            $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
 
@@ -185,14 +214,13 @@ final class LedgerReplayer
         $expectedHmac = hash_hmac('sha256', $event->hash, $this->hmacKey);
         if (!hash_equals($expectedHmac, $event->hmac)) {
             $this->quarantine($event, $expectedChainHash, $sourceCluster);
-            $msg->ack();
+            $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
 
-        // Persist to ledger + apply to main DB in one atomic step.
         $now = gmdate('Y-m-d\TH:i:s\Z');
 
-        $this->db->transaction(function (LedgerConnection $db) use ($event, $now, $consumerName, $sourceCluster): void {
+        $this->db->transaction(function (LedgerConnection $db) use ($event, $now): void {
             // INSERT OR IGNORE as a safety net against concurrent coroutines.
             $affected = $db->execute(
                 'INSERT OR IGNORE INTO events
@@ -244,30 +272,56 @@ final class LedgerReplayer
             );
         });
 
-        // Update ownership registry if aggregate info is present.
-        if ($event->aggregateType !== null && $event->aggregateId !== null) {
-            $this->ownership->recordRemoteOwnership(
-                $event->aggregateType,
-                $event->aggregateId,
-                $event->originNode,
-            );
+        // The event is durable in the ledger now; applying it is a separate
+        // step so a failed handler leaves a row without applied_at, which the
+        // duplicate path above retries on the next delivery.
+        if (!$this->applyAndMark($event, $msg)) {
+            return;
         }
 
-        // Apply to main database via registered replay handler (idempotent).
-        $this->handlerRegistry->apply(
-            $event,
-            fn (string $class): object => ContainerFactory::get()->resolve($class),
-        );
+        $this->ack($msg, $sourceCluster, $event->eventId);
+    }
 
-        // Mark event as applied.
+    /**
+     * Apply a stored event to the main database and stamp applied_at. On
+     * failure the message is naked and false returned.
+     */
+    private function applyAndMark(LedgerEvent $event, PulledMessage $msg): bool
+    {
+        try {
+            if ($event->aggregateType !== null && $event->aggregateId !== null) {
+                $this->ownership->recordRemoteOwnership(
+                    $event->aggregateType,
+                    $event->aggregateId,
+                    $event->originNode,
+                );
+            }
+
+            // Registered replay handlers are idempotent by contract.
+            $this->handlerRegistry->apply($event, $this->resolveHandler);
+        } catch (\Throwable $e) {
+            StaticLoggerBridge::error('ledger', 'Apply failed, will retry', [
+                'event_id' => $event->eventId,
+                'event'    => "{$event->domain}.{$event->eventType}",
+                'origin'   => $event->originNode,
+                'error'    => $e->getMessage(),
+            ]);
+            $msg->nak(self::RETRY_DELAY);
+            return false;
+        }
+
         $this->db->execute(
             'UPDATE events SET applied_at = :now WHERE event_id = :id',
-            ['now' => $now, 'id' => $event->eventId]
+            ['now' => gmdate('Y-m-d\TH:i:s\Z'), 'id' => $event->eventId]
         );
 
-        // Advance cluster consumer position.
-        $this->updateConsumerState($consumerName, $sourceCluster, $event->eventId);
+        return true;
+    }
 
+    /** Ack, and remember how far into the stream this node has consumed. */
+    private function ack(PulledMessage $msg, string $clusterId, ?string $eventId): void
+    {
+        $this->updateConsumerState($clusterId, $eventId, $msg->streamSequence);
         $msg->ack();
     }
 
@@ -286,31 +340,26 @@ final class LedgerReplayer
         return $row !== null ? (int) $row['last_nats_sequence'] : 0;
     }
 
-    private function updateConsumerState(string $consumerName, string $clusterId, string $lastEventId): void
+    /**
+     * The stream sequence comes from the delivery itself. It used to be read
+     * from publish_log, which only holds this node's OWN publishes, so the
+     * position stayed 0 for every remote event.
+     */
+    private function updateConsumerState(string $clusterId, ?string $lastEventId, int $natsSeq): void
     {
-        // Retrieve nats_sequence from publish_log for this cluster if available.
-        $row = $this->db->fetchOne(
-            'SELECT nats_sequence FROM publish_log
-             WHERE event_id = :id AND cluster_id = :cluster',
-            ['id' => $lastEventId, 'cluster' => $clusterId]
-        );
-
-        $natsSeq = $row !== null ? (int) $row['nats_sequence'] : 0;
-        $now     = gmdate('Y-m-d\TH:i:s\Z');
-
         $this->db->execute(
             'INSERT INTO consumer_state (consumer_id, cluster_id, last_nats_sequence, last_event_id, updated_at)
              VALUES (:consumer, :cluster, :seq, :event_id, :now)
              ON CONFLICT(consumer_id, cluster_id) DO UPDATE SET
                last_nats_sequence = CASE WHEN :seq > last_nats_sequence THEN :seq ELSE last_nats_sequence END,
-               last_event_id      = :event_id,
+               last_event_id      = COALESCE(:event_id, last_event_id),
                updated_at         = :now',
             [
-                'consumer' => $consumerName,
+                'consumer' => $this->consumerName(),
                 'cluster'  => $clusterId,
                 'seq'      => $natsSeq,
                 'event_id' => $lastEventId,
-                'now'      => $now,
+                'now'      => gmdate('Y-m-d\TH:i:s\Z'),
             ]
         );
     }
@@ -334,11 +383,10 @@ final class LedgerReplayer
             ]
         );
 
-        error_log(sprintf(
-            '[semitexa-ledger] EVENT QUARANTINED event_id=%s origin=%s cluster=%s',
-            $event->eventId,
-            $event->originNode,
-            $sourceCluster,
-        ));
+        StaticLoggerBridge::error('ledger', 'Event quarantined — hash or HMAC mismatch, never applied', [
+            'event_id' => $event->eventId,
+            'origin'   => $event->originNode,
+            'cluster'  => $sourceCluster,
+        ]);
     }
 }

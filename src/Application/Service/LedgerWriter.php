@@ -59,6 +59,16 @@ final class LedgerWriter
             return null;
         }
 
+        // The payload is read through getters. An event that carries its data
+        // in public (readonly) properties serialises to [] — and every peer
+        // would replay an event with no data in it. Refuse it here, loudly.
+        if ($payload === [] && (new \ReflectionClass($eventClass))->getProperties() !== []) {
+            throw new \LogicException(
+                "Propagated event {$eventClass} serialised to an empty payload: expose its data through " .
+                'get*() getters (with matching set*() setters for replay), not public properties.'
+            );
+        }
+
         $domain    = $propagated->domain ?? $this->deriveDomain($eventClass);
         $eventType = $this->deriveEventType($eventClass);
         [$aggregateType, $aggregateId] = $this->resolveAggregate($event, $eventClass, $payload);

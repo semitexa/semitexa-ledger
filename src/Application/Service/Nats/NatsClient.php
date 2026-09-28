@@ -9,6 +9,7 @@ use Semitexa\Ledger\Domain\Model\ClusterConfig;
 use Basis\Nats\Client;
 use Basis\Nats\Configuration;
 use Basis\Nats\Consumer\DeliverPolicy;
+use Basis\Nats\Message\Msg;
 use Basis\Nats\Message\Payload;
 
 /**
@@ -63,18 +64,35 @@ final class NatsClient
     }
 
     /**
-     * Publish a message to a JetStream-captured subject with deduplication headers.
+     * Publish to a JetStream-captured subject and wait for the stream's PubAck.
      *
-     * JetStream captures the message if the subject matches a configured stream.
-     * The Nats-Msg-Id header enables server-side deduplication within DuplicateWindow.
+     * Returns the stream sequence the message was stored at. Throws when no
+     * stream captured the subject or the server refused it, so a caller never
+     * marks as published an event nothing stored. A PubAck flagged duplicate
+     * (same Nats-Msg-Id inside the stream's duplicate window) still returns the
+     * original sequence: the event IS in the stream.
+     *
+     * Headers ride on the Payload object — Client::publish() takes three
+     * arguments and silently dropped the fourth, so Nats-Msg-Id never reached
+     * the server and dedup never happened.
      *
      * @param array<string, string> $headers  e.g. ['Nats-Msg-Id' => $eventId]
      */
-    public function jetStreamPublish(string $subject, string $payload, array $headers = []): void
+    public function jetStreamPublish(string $subject, string $payload, array $headers = [], float $timeoutSeconds = 5.0): int
     {
-        // basis-company/nats sends headers via the Payload object when supported.
-        // The Nats-Msg-Id header is set as a NATS header (NATS 2.x HPUB protocol).
-        $this->client->publish($subject, $payload, null, $headers);
+        $reply = $this->client->dispatch($subject, new Payload($payload, $headers), $timeoutSeconds);
+
+        $body = $reply instanceof Payload ? $reply->body : (string) $reply;
+        $ack  = json_decode($body, true);
+
+        if (!is_array($ack) || isset($ack['error']) || !isset($ack['seq'])) {
+            $reason = is_array($ack) && isset($ack['error']['description'])
+                ? (string) $ack['error']['description']
+                : ($body === '' ? 'no stream captured the subject' : $body);
+            throw new \RuntimeException("JetStream refused publish to '{$subject}': {$reason}");
+        }
+
+        return (int) $ack['seq'];
     }
 
     /**
@@ -195,33 +213,69 @@ final class NatsClient
     }
 
     /**
-     * Pull a batch of messages from a durable pull consumer.
+     * Pull up to $batchSize messages from a durable pull consumer WITHOUT
+     * acknowledging them — the caller acks or naks each one.
      *
-     * Each message in the returned array has:
-     *   ->body   — raw string payload
-     *   ->ack()  — acknowledge delivery
-     *   ->nak()  — negative-acknowledge (triggers redelivery)
+     * Consumer::handle() acks on receipt and hands its callback a bare Payload,
+     * which has no ack()/nak(); this reads the delivery queue directly so the
+     * reply subject survives.
      *
-     * @return list<Payload>
+     * @return list<PulledMessage>
      */
     public function pullMessages(
         string $streamName,
         string $consumerName,
         int $batchSize = 50,
+        float $waitSeconds = 1.0,
     ): array {
-        $api      = $this->client->getApi();
-        $stream   = $api->getStream($streamName);
-        $consumer = $stream->getConsumer($consumerName);
+        $consumer = $this->client->getApi()->getStream($streamName)->getConsumer($consumerName);
+        $consumer->setBatching($batchSize)->setExpires($waitSeconds);
+
+        // Read a little past the server-side expiry: a batch the server sends
+        // just before it expires must not land on an inbox already abandoned
+        // (it would sit unacked until ack_wait and arrive late, out of order).
+        $queue = $consumer->getQueue();
+        $queue->setTimeout($waitSeconds + 0.5);
+
+        try {
+            $raw = $queue->fetchAll($batchSize);
+        } finally {
+            $this->client->unsubscribe($queue);
+        }
 
         $messages = [];
+        foreach ($raw as $msg) {
+            if (!$msg instanceof Msg || $msg->payload->isEmpty()) {
+                // Status frames (404 no messages, 408 request timeout) carry no body.
+                continue;
+            }
 
-        $consumer
-            ->setIterations($batchSize)
-            ->handle(function (Payload $payload) use (&$messages): void {
-                $messages[] = $payload;
-            });
+            $messages[] = new PulledMessage(
+                body:           $msg->payload->body,
+                streamSequence: PulledMessage::streamSequenceFromReplyTo($msg->replyTo),
+                ack:            static fn () => $msg->ack(),
+                nak:            static fn (float $delay) => $msg->nack($delay),
+            );
+        }
 
         return $messages;
+    }
+
+    /** How many messages the stream currently holds. */
+    public function streamMessageCount(string $streamName): int
+    {
+        $info = $this->client->getApi()->getStream($streamName)->info();
+
+        return (int) ($info->state->messages ?? 0);
+    }
+
+    /** Remove a stream and every message in it. Test and operator cleanup. */
+    public function deleteStream(string $streamName): void
+    {
+        $stream = $this->client->getApi()->getStream($streamName);
+        if ($stream->exists()) {
+            $stream->delete();
+        }
     }
 
     /**

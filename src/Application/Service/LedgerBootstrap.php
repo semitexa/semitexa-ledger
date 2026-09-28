@@ -21,6 +21,7 @@ use Semitexa\Ledger\Application\Service\LedgerWriter;
 use Semitexa\Ledger\Application\Service\ReplayHandlerRegistry;
 use Semitexa\Ledger\Application\Service\Nats\ClusterHealthTracker;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\EventStream;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 use Semitexa\Ledger\Application\Service\OwnershipCache;
 use Semitexa\Ledger\Application\Service\Queue\DualWriteTransport;
@@ -34,8 +35,9 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
  *  2. Connect to all configured NATS clusters.
  *  3. Register NatsTransport with QueueTransportRegistry.
  *  4. Hook LedgerWriter into EventDispatcher's post-dispatch pipeline.
- *  5. Start LedgerPublisher + LedgerReplayer as background Swoole coroutines.
- *  6. Start CommandProcessor NATS subscription loop.
+ *  5. Start LedgerPublisher + LedgerReplayer as background Swoole coroutines,
+ *     in worker 0 only (see ownsBackgroundLoops()).
+ *  6. Start the CommandProcessor NATS subscription loop, same worker.
  *
  * Required environment variables:
  *   LEDGER_ENABLED    — set to 1/true/yes/on to enable the ledger explicitly
@@ -49,6 +51,9 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
  *   NATS_SECONDARY_URL     — enables secondary cluster for HA
  *   EVENTS_DUAL_PRIMARY    — enables dual-write mode (primary transport name)
  *   EVENTS_DUAL_SECONDARY  — secondary transport name
+ *   LEDGER_STREAM          — JetStream stream name (default: EVENTS)
+ *   LEDGER_SUBJECT_PREFIX  — event subject namespace (default: semitexa.events);
+ *                            distinct per project sharing one NATS server
  */
 #[AsServerLifecycleListener(
     phase: ServerLifecyclePhase::WorkerStartAfterContainer->value,
@@ -160,24 +165,84 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         $dispatcher = $container->get(EventDispatcher::class);
         $dispatcher->addPostDispatchHook(new LedgerDispatchHook($writer->append(...)));
 
-        // 5. Start LedgerPublisher background coroutine.
-        $publisher = new LedgerPublisher($db, $nodeId, $clusters, $health);
-        \Swoole\Coroutine::create(fn () => $publisher->runRetryLoop());
-
-        // 6. Start LedgerReplayer (starts per-cluster coroutines internally).
-        $replayer = new LedgerReplayer($db, $nodeId, $hmacKey, $clusters, $handlerRegistry, $ownership);
-        $replayer->start();
-
-        // 7. Start CommandProcessor subscription.
+        // 5-7. Background loops: publisher, replayer, command listener.
         $commandRegistry = new CommandRegistry(
             $container->get(\Semitexa\Core\Discovery\ClassDiscovery::class),
         );
         $processor = new CommandProcessor($nodeId, $clusters, $ownership, $commandRegistry);
-        $processor->startListeners();
+
+        if ($this->ownsBackgroundLoops($context)) {
+            $this->startBackgroundLoops(
+                $db,
+                $nodeId,
+                $hmacKey,
+                $health,
+                $handlerRegistry,
+                $ownership,
+                $commandRegistry,
+                static fn (string $class): object => $container->resolve($class),
+            );
+        }
 
         // 8. Register CommandBus in the container so application handlers can inject it.
         $commandBus = new CommandBus($nodeId, $ownership, $clusters, $processor);
         $container->set(CommandBus::class, $commandBus);
+    }
+
+    /**
+     * The background loops run in ONE worker per node. Every worker used to
+     * start its own set: N replayers shared the node's durable consumer, so a
+     * worker received event 7 while another still held 6 and naked it as a
+     * gap; N publishers raced over the same pending rows; and N plain NATS
+     * subscriptions ran every routed command N times. The writer hook stays in
+     * every worker — any worker can dispatch an event.
+     */
+    protected function ownsBackgroundLoops(ServerLifecycleContext $context): bool
+    {
+        return $context->workerId === 0;
+    }
+
+    /**
+     * Each loop gets its own NATS connections. basis-company/nats reads replies
+     * off one socket; two coroutines waiting on the same client steal each
+     * other's frames (a publisher's PubAck consumed by the replayer's pull).
+     *
+     * @param \Closure(class-string): object $resolveHandler
+     */
+    private function startBackgroundLoops(
+        LedgerConnection $db,
+        string $nodeId,
+        string $hmacKey,
+        ClusterHealthTracker $health,
+        ReplayHandlerRegistry $handlerRegistry,
+        AggregateOwnershipService $ownership,
+        CommandRegistry $commandRegistry,
+        \Closure $resolveHandler,
+    ): void {
+        $stream = EventStream::fromEnv();
+
+        $publisherClusters = ClusterRegistry::fromEnv();
+        $publisherClusters->connect();
+        $publisher = new LedgerPublisher($db, $nodeId, $publisherClusters, $health, $stream);
+        \Swoole\Coroutine::create(fn () => $publisher->runRetryLoop());
+
+        $replayerClusters = ClusterRegistry::fromEnv();
+        $replayerClusters->connect();
+        $replayer = new LedgerReplayer(
+            $db,
+            $nodeId,
+            $hmacKey,
+            $replayerClusters,
+            $handlerRegistry,
+            $ownership,
+            $resolveHandler,
+            $stream,
+        );
+        $replayer->start();
+
+        $listenerClusters = ClusterRegistry::fromEnv();
+        $listenerClusters->connect();
+        (new CommandProcessor($nodeId, $listenerClusters, $ownership, $commandRegistry))->startListeners();
     }
 
     // -------------------------------------------------------------------------
