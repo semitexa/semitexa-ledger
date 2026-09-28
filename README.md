@@ -45,7 +45,7 @@ final class StockAdjusted
 }
 ```
 
-Getter/setter DTOs are supported. Ledger payload serialization uses the same getter convention as the core `PayloadSerializer`.
+Getter/setter DTOs are supported. Ledger payload serialization uses the same getter convention as the core `PayloadSerializer`. An event that keeps its data in public properties would serialise to an empty payload, so the writer refuses it.
 
 ## Enforce Aggregate Ownership
 
@@ -77,7 +77,7 @@ Register an idempotent replay handler for events that must update the local main
 ```php
 use Semitexa\Ledger\Attribute\AsReplayHandler;
 use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
-use Semitexa\Ledger\Dto\LedgerEvent;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
 
 #[AsReplayHandler(domain: 'inventory', eventType: 'stock_adjusted')]
 final class StockAdjustedReplayHandler implements ReplayHandlerInterface
@@ -88,6 +88,23 @@ final class StockAdjustedReplayHandler implements ReplayHandlerInterface
     }
 }
 ```
+
+## Check Replication
+
+With the server running on every node:
+
+```bash
+bin/semitexa ledger:probe            # on node A: append a probe event
+bin/semitexa ledger:status           # on node B: events per origin, pending, unapplied, quarantined
+bin/semitexa ledger:status --probe=<probe_id> --json
+bin/semitexa system:doctor           # ledger.multi-node: node-local defaults that break a cluster
+```
+
+`tests/Harness/two-node/run.sh` boots two full servers (own database, Redis and ledger each) against one JetStream server and checks both directions plus a burst.
+
+The publisher, replayer and command listener run in worker 0 of each server. Set `LEDGER_STREAM` and `LEDGER_SUBJECT_PREFIX` per project when several projects share one NATS server.
+
+`CommandBus` is not registered in the container yet: owner-routed commands wait for the ownership design.
 
 ## Current Example In This Repo
 

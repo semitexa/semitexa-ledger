@@ -10,7 +10,6 @@ use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleContext;
 use Semitexa\Core\Server\Lifecycle\ServerLifecycleListenerInterface;
 use Semitexa\Core\Server\Lifecycle\ServerLifecyclePhase;
-use Semitexa\Ledger\Application\Service\CommandBus;
 use Semitexa\Ledger\Application\Service\CommandProcessor;
 use Semitexa\Ledger\Application\Service\CommandRegistry;
 use Semitexa\Ledger\Application\Service\LedgerConnection;
@@ -38,6 +37,8 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
  *  5. Start LedgerPublisher + LedgerReplayer as background Swoole coroutines,
  *     in worker 0 only (see ownsBackgroundLoops()).
  *  6. Start the CommandProcessor NATS subscription loop, same worker.
+ *
+ * CommandBus is not registered in the container (see the end of boot()).
  *
  * Required environment variables:
  *   LEDGER_ENABLED    — set to 1/true/yes/on to enable the ledger explicitly
@@ -169,7 +170,6 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         $commandRegistry = new CommandRegistry(
             $container->get(\Semitexa\Core\Discovery\ClassDiscovery::class),
         );
-        $processor = new CommandProcessor($nodeId, $clusters, $ownership, $commandRegistry);
 
         if ($this->ownsBackgroundLoops($context)) {
             $this->startBackgroundLoops(
@@ -184,9 +184,12 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
             );
         }
 
-        // 8. Register CommandBus in the container so application handlers can inject it.
-        $commandBus = new CommandBus($nodeId, $ownership, $clusters, $processor);
-        $container->set(CommandBus::class, $commandBus);
+        // CommandBus is NOT registered. This used to $container->set() it here,
+        // but the container is sealed by WorkerStartAfterContainer, so the call
+        // threw and took down every worker of any server with the ledger
+        // enabled — found by the two-node harness. Nothing injects it yet; it
+        // gets a container registration together with the ownership design
+        // (ep-multi-node-sync, tk-mn-conflict-model).
     }
 
     /**
