@@ -13,7 +13,7 @@
         "php": "^8.4",
         "ext-sqlite3": "*",
         "semitexa/core": ">=2026.09.13.1330 || dev-master",
-        "semitexa/orm": ">=2026.09.28.1812 || dev-master",
+        "semitexa/orm": ">=2026.09.29.0833 || dev-master",
         "basis-company/nats": "^1.1"
     },
     "autoload": {
@@ -32,7 +32,7 @@
         },
         "semitexa": {
             "floors": {
-                "semitexa/orm": "next"
+                "semitexa/orm": "2026.09.29.0833"
             }
         }
     },
