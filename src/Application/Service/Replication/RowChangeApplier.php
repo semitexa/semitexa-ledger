@@ -11,6 +11,7 @@ use Semitexa\Ledger\Domain\Model\FieldStamp;
 use Semitexa\Ledger\Domain\Model\HlcTimestamp;
 use Semitexa\Ledger\Domain\Model\RowChangePayload;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
+use Semitexa\Orm\Application\Service\Persistence\ReplicatedWriteGuard;
 use Semitexa\Orm\Adapter\ServerCapability;
 use Semitexa\Orm\Adapter\SqlIdentifier;
 
@@ -44,6 +45,16 @@ final class RowChangeApplier
      * @param array<mixed> $payload a ReplicationCaptureService event payload, as received
      */
     public function apply(array $payload, DatabaseAdapterInterface $db): void
+    {
+        // The applier is the other writer a #[Replicated] table accepts: it
+        // writes rows from other nodes, which must not be captured again.
+        ReplicatedWriteGuard::permit(fn () => $this->merge($payload, $db));
+    }
+
+    /**
+     * @param array<mixed> $payload
+     */
+    private function merge(array $payload, DatabaseAdapterInterface $db): void
     {
         try {
             $change = RowChangePayload::fromArray($payload);

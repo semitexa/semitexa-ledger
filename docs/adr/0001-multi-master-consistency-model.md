@@ -75,8 +75,13 @@ All fields not involved in the conflict still converge.
   tables — queues, leases, locks, sessions, caches — never do.
 - A replicated resource must use a UUIDv7 primary key (`auto` would collide).
 - A replicated resource must be written through the ORM engine; writing its
-  table with raw SQL is rejected by a static rule, because such writes would
-  never be captured.
+  table any other way is refused, because such writes would never be
+  captured. *Amended 2026-09-28:* the refusal is a runtime guard in the ORM
+  adapters (`ReplicatedWriteGuard`), not a static rule — nearly every raw
+  write in the codebase names its table through a variable (`UPDATE %s`,
+  `new InsertQuery($metadata->tableName, …)`), which no static rule can
+  follow. The adapters see the real table name; only the write engine and
+  the replication applier are permitted.
 
 ### 7. Capture: a transactional outbox in the application database
 

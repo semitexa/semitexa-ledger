@@ -151,12 +151,24 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame([300_000_000_000, 5], $settings[1]);
     }
 
+    /**
+     * Acks travel to the server asynchronously, so a count read right after
+     * the last ack can still include it. Wait briefly for the server to catch
+     * up; a delivery that was never acked stays pending past the deadline.
+     */
     private function pendingAcks(): int
     {
         $pending = null;
         Coroutine\run(function () use (&$pending): void {
-            $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
-            $pending = $client->pendingAcks('QUEUE', NatsTransport::consumerName($this->queue));
+            $client   = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+            $deadline = microtime(true) + 2.0;
+            do {
+                $pending = $client->pendingAcks('QUEUE', NatsTransport::consumerName($this->queue));
+                if ($pending === 0) {
+                    return;
+                }
+                Coroutine::sleep(0.1);
+            } while (microtime(true) < $deadline);
         });
 
         return (int) $pending;
