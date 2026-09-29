@@ -50,6 +50,12 @@ trait RequiresReplicationTables
             'CREATE TABLE IF NOT EXISTS replication_tombstone (id BIGINT AUTO_INCREMENT PRIMARY KEY, table_name VARCHAR(64) NOT NULL, '
             . 'row_pk VARCHAR(191) NOT NULL, image LONGTEXT NOT NULL, UNIQUE KEY uniq_replication_tombstone (table_name, row_pk))'
         );
+        $this->db->execute(
+            'CREATE TABLE IF NOT EXISTS replication_conflict (id BIGINT AUTO_INCREMENT PRIMARY KEY, conflict_key CHAR(40) NOT NULL, '
+            . 'table_name VARCHAR(64) NOT NULL, row_pk VARCHAR(191) NOT NULL, columns TEXT NOT NULL, incoming LONGTEXT NOT NULL, '
+            . 'local LONGTEXT NULL, origin_node VARCHAR(64) NOT NULL, reason VARCHAR(500) NOT NULL, detected_at DATETIME NOT NULL, '
+            . 'UNIQUE KEY uniq_replication_conflict (conflict_key), KEY idx_replication_conflict_row (table_name, row_pk))'
+        );
         $this->wipeReplicationState();
     }
 
@@ -60,6 +66,7 @@ trait RequiresReplicationTables
         $this->db->execute('DELETE FROM replication_tombstone WHERE table_name = :t', ['t' => self::ARTICLES]);
         $this->db->execute('DELETE FROM replication_outbox');
         $this->db->execute('DELETE FROM replication_outbox_dead');
+        $this->db->execute('DELETE FROM replication_conflict');
     }
 
     private function dropReplicationFixture(): void

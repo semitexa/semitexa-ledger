@@ -9,11 +9,13 @@ use Semitexa\Core\Support\Row;
 use Semitexa\Ledger\Application\Service\HybridLogicalClock;
 use Semitexa\Ledger\Domain\Model\FieldStamp;
 use Semitexa\Ledger\Domain\Model\HlcTimestamp;
+use Semitexa\Ledger\Domain\Model\ReplicationConflict;
 use Semitexa\Ledger\Domain\Model\RowChangePayload;
 use Semitexa\Orm\Adapter\DatabaseAdapterInterface;
 use Semitexa\Orm\Application\Service\Persistence\ReplicatedWriteGuard;
 use Semitexa\Orm\Adapter\ServerCapability;
 use Semitexa\Orm\Adapter\SqlIdentifier;
+use Semitexa\Orm\Exception\ConstraintViolationException;
 
 /**
  * Merges a replicated row change from another node into this one (ADR 0001).
@@ -25,6 +27,12 @@ use Semitexa\Orm\Adapter\SqlIdentifier;
  *
  * Writes go straight to the table on the caller's transaction, never through
  * the ORM engine: a merged change must not be captured again and echoed back.
+ *
+ * A change that breaks a unique or CHECK constraint here is taken in part: the
+ * fields that break it are left as they are and journaled with both versions
+ * (ADR 0001 §5), every other field it won is applied. Throwing instead rolled
+ * the whole change back, the replayer retried it forever, and every later
+ * change from its origin queued behind it.
  */
 final class RowChangeApplier
 {
@@ -43,18 +51,24 @@ final class RowChangeApplier
 
     /**
      * @param array<mixed> $payload a ReplicationCaptureService event payload, as received
+     * @return list<ReplicationConflict> conflicts journaled for the first time by this
+     *         apply — for the caller to announce once its transaction has committed
      */
-    public function apply(array $payload, DatabaseAdapterInterface $db): void
+    public function apply(array $payload, DatabaseAdapterInterface $db): array
     {
         // The applier is the other writer a #[Replicated] table accepts: it
         // writes rows from other nodes, which must not be captured again.
-        ReplicatedWriteGuard::permit(fn () => $this->merge($payload, $db));
+        /** @var list<ReplicationConflict> $conflicts */
+        $conflicts = ReplicatedWriteGuard::permit(fn (): array => $this->merge($payload, $db));
+
+        return $conflicts;
     }
 
     /**
      * @param array<mixed> $payload
+     * @return list<ReplicationConflict>
      */
-    private function merge(array $payload, DatabaseAdapterInterface $db): void
+    private function merge(array $payload, DatabaseAdapterInterface $db): array
     {
         try {
             $change = RowChangePayload::fromArray($payload);
@@ -71,7 +85,7 @@ final class RowChangeApplier
             // half of it is not applied. Refused here, and the event stays in
             // the ledger for inspection.
             StaticLoggerBridge::error('ledger', 'Replicated change refused: malformed payload', ['error' => $e->getMessage()]);
-            return;
+            return [];
         }
 
         $table    = $change->table;
@@ -97,7 +111,7 @@ final class RowChangeApplier
                 'pk_column' => $pkColumn,
                 'origin'    => $change->node,
             ]);
-            return;
+            return [];
         }
 
         $columns = $this->columnsOf($db, $table);
@@ -106,11 +120,12 @@ final class RowChangeApplier
             // is stored for it and nothing is cached, so `ledger:replay` after
             // the migration applies it.
             StaticLoggerBridge::warning('ledger', 'Replicated change for a table not created yet; kept in the ledger only', ['table' => $table]);
-            return;
+            return [];
         }
 
         $clocks = FieldClocks::lockAndRead($db, $table, $rowKey);
         $row    = $this->lockRow($db, $table, $pkColumn, $pk);
+        $conflicts = [];
 
         $won = [];
         foreach ($incoming as $column => $field) {
@@ -124,7 +139,7 @@ final class RowChangeApplier
         }
 
         if ($won === []) {
-            return; // nothing newer than what is here — including a repeat of this very change
+            return []; // nothing newer than what is here — including a repeat of this very change
         }
 
         $exists = isset($won[ReplicationCaptureService::EXISTS])
@@ -148,7 +163,13 @@ final class RowChangeApplier
                 Tombstones::bury($db, $table, $rowKey, array_replace($base, $values));
             }
         } elseif ($row !== null) {
-            $this->update($db, $table, $pkColumn, $pk, $values);
+            [$unapplied, $reason] = $this->updateAroundConflicts($db, $table, $pkColumn, $pk, $values);
+            if ($unapplied !== []) {
+                // Their clocks are not stored: the value here stays what it was
+                // and a later change still carrying them is tried again.
+                $won = array_diff_key($won, array_flip($unapplied));
+                $conflicts[] = $this->conflict($change, $decoded, $unapplied, $row, $clocks, $reason);
+            }
         } else {
             // Created, or back from a delete. Fields this change did not win
             // come from what this node last had (the tombstone), else from the
@@ -166,7 +187,17 @@ final class RowChangeApplier
                 }
             }
             $full[$pkColumn] = $pk;
-            $this->insert($db, $table, $full);
+            try {
+                $this->insert($db, $table, $full);
+            } catch (\Throwable $e) {
+                if (!self::isConflict($e)) {
+                    throw $e;
+                }
+                // A row cannot exist in part. Nothing of it is kept here — no
+                // clocks either, so a later change of it tries the insert again
+                // once the conflicting value is gone.
+                return $this->journal($db, [$this->conflict($change, $decoded, [], null, $clocks, $e->getMessage())]);
+            }
             Tombstones::remove($db, $table, $rowKey);
         }
 
@@ -176,6 +207,116 @@ final class RowChangeApplier
             $rowKey,
             array_map(static fn (FieldStamp $field): array => [$field->clock->toString(), $field->node], $won),
         );
+
+        return $this->journal($db, $conflicts);
+    }
+
+    /**
+     * Update the row; if that breaks a constraint, apply the fields one at a
+     * time and leave out those that break it.
+     *
+     * A failed statement is undone on its own — the transaction stays usable —
+     * so the fields that do fit still land in this same transaction.
+     *
+     * @param array<string, mixed> $values
+     * @return array{0: list<string>, 1: string} the fields left unapplied, and why
+     */
+    private function updateAroundConflicts(DatabaseAdapterInterface $db, string $table, string $pkColumn, string $pk, array $values): array
+    {
+        try {
+            $this->update($db, $table, $pkColumn, $pk, $values);
+
+            return [[], ''];
+        } catch (\Throwable $e) {
+            if (!self::isConflict($e)) {
+                throw $e;
+            }
+            $reason = $e->getMessage();
+        }
+
+        $unapplied = [];
+        foreach ($values as $column => $value) {
+            try {
+                $this->update($db, $table, $pkColumn, $pk, [$column => $value]);
+            } catch (\Throwable $e) {
+                if (!self::isConflict($e)) {
+                    throw $e;
+                }
+                $unapplied[] = $column;
+                $reason = $e->getMessage();
+            }
+        }
+
+        return [$unapplied, $reason];
+    }
+
+    /**
+     * Only what two nodes can each write legitimately and still disagree on: a
+     * unique value, a CHECK bound. A missing parent or a NOT NULL column is not
+     * a conflict — the first is delivery order, the second a schema gap — and
+     * keeps failing the apply, as before.
+     */
+    private static function isConflict(\Throwable $e): bool
+    {
+        if ($e instanceof ConstraintViolationException) {
+            // 1062 duplicate entry, 1586 duplicate entry for a named key.
+            return in_array($e->driverCode, [1062, 1586], true);
+        }
+
+        // MySQL reports a CHECK violation as HY000, outside the 23xxx class the
+        // ORM turns into ConstraintViolationException.
+        return $e instanceof \PDOException && (int) ($e->errorInfo[1] ?? 0) === 3819;
+    }
+
+    /**
+     * @param array<string, mixed> $decoded the change's values
+     * @param list<string> $columns
+     * @param array<string, mixed>|null $row
+     */
+    private function conflict(RowChangePayload $change, array $decoded, array $columns, ?array $row, FieldClocks $clocks, string $reason): ReplicationConflict
+    {
+        $incomingClocks = array_map(static fn (FieldStamp $f): array => [$f->clock->toString(), $f->node], $change->fields);
+        $localClocks = [];
+        foreach (array_keys($row ?? []) as $column) {
+            $clock = $clocks->of((string) $column);
+            if ($clock !== null) {
+                $localClocks[(string) $column] = $clock;
+            }
+        }
+
+        return new ReplicationConflict(
+            table: $change->table,
+            rowKey: $change->rowKey,
+            columns: $columns,
+            incoming: $decoded,
+            incomingClocks: $incomingClocks,
+            local: $row,
+            localClocks: $localClocks,
+            originNode: $change->node,
+            reason: $reason,
+        );
+    }
+
+    /**
+     * @param list<ReplicationConflict> $conflicts
+     * @return list<ReplicationConflict> the ones recorded for the first time
+     */
+    private function journal(DatabaseAdapterInterface $db, array $conflicts): array
+    {
+        $new = [];
+        foreach ($conflicts as $conflict) {
+            StaticLoggerBridge::warning('ledger', 'Replicated change applied in part: it breaks a constraint here', [
+                'table'   => $conflict->table,
+                'row'     => $conflict->rowKey,
+                'columns' => $conflict->columns,
+                'origin'  => $conflict->originNode,
+            ]);
+            if (ConflictJournal::record($db, $conflict)) {
+                $new[] = $conflict;
+            }
+        }
+
+        return $new;
     }
 
     /** @return list<string>|null */
