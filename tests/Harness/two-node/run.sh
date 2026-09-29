@@ -11,6 +11,10 @@
 #   5. a partition: both nodes cut off from NATS, both edit the same rows —
 #      different fields, the same field, a delete against a later edit — and
 #      after the network heals both hold the same, expected rows
+#   6. a replication conflict: apart, both nodes create a row with the same
+#      unique title. After the heal each journals and announces the other's row
+#      once, keeps it out, and the stream still flows past it; renaming one
+#      row (an ordinary replicated write) lets both converge
 #
 # Usage (from anywhere):
 #   packages/semitexa-ledger/tests/Harness/two-node/run.sh          # run, then tear down
@@ -165,4 +169,60 @@ for node in node-a node-b; do
     [ "$q" = 0 ] || fail "$node quarantined $q event(s)"
 done
 
-say "PASS: probes both ways + burst of $BURST; replicated rows converge after a partition (field merge, same-field LWW, delete vs later edit)"
+conflicts() { cli "$1" harness:note conflicts; }
+N4=01a0e7b0-0000-7000-8000-000000000004
+N5=01a0e7b0-0000-7000-8000-000000000005
+N6=01a0e7b0-0000-7000-8000-000000000006
+has_row() { # has_row <node> <id>
+    python3 -c 'import json,sys; sys.exit(0 if any(r["id"] == sys.argv[2] for r in json.loads(sys.argv[1])) else 1)' "$(dump "$1")" "$2"
+}
+
+say "6. conflict: apart, both nodes take the same unique title"
+wan disconnect node-a
+wan disconnect node-b
+note node-a create --id=$N4 --title=DUP --body=on-A
+note node-b create --id=$N5 --title=DUP --body=on-B
+sleep "${PARTITION_SECONDS:-10}"
+wan connect node-a
+wan connect node-b
+
+# Past the conflict, the stream still flows — both ways. Before the journal,
+# the conflicting event was retried forever and everything behind it waited.
+note node-a create --id=$N6 --title=T6 --body=after-the-conflict
+note node-b set --id=$N1 --field=body --value=after-the-conflict
+WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "node-a's later row on node-b" "has_row node-b $N6"
+WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "node-b's later edit on node-a" \
+    "[ \"\$(json_field \"\$(dump node-a)\" \"[r['body'] for r in d if r['id']=='$N1'][0]\")\" = after-the-conflict ]"
+echo "later changes crossed both ways"
+
+for pair in "node-a $N5 $N4" "node-b $N4 $N5"; do
+    set -- $pair
+    node="$1" missing="$2" own="$3"
+    has_row "$node" "$own" || fail "$node lost its own row $own"
+    ! has_row "$node" "$missing" || fail "$node created $missing although its title is taken here"
+    c="$(conflicts "$node")"
+    echo "$node conflicts: $c"
+    [ "$(json_field "$c" "[(j['row'], j['columns']) for j in d['journaled']] == [('$missing', [])]")" = True ] \
+        || fail "$node did not journal exactly the conflict on $missing"
+    [ "$(json_field "$c" "[a['row'] for a in d['announced']] == ['$missing']")" = True ] \
+        || fail "$node did not announce the conflict on $missing exactly once"
+done
+
+say "   resolve: node-b renames its row; node-a re-sends its own"
+note node-b set --id=$N5 --field=title --value=DUP-b
+# A row kept out by a conflict is retried when a change of IT arrives, not when
+# the value frees up elsewhere — the resolving side re-sends it.
+note node-a set --id=$N4 --field=body --value=on-A-resolved
+WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "both nodes to converge after the resolution" \
+    '[ "$(dump node-a)" = "$(dump node-b)" ] && has_row node-a '$N5' && has_row node-b '$N4
+echo "both nodes: $(dump node-a)"
+
+for node in node-a node-b; do
+    c="$(conflicts "$node")"
+    [ "$(json_field "$c" "len(d['announced'])")" = 1 ] || fail "$node announced the conflict again: $c"
+    cli "$node" ledger:verify >/dev/null || fail "ledger:verify failed on $node after the conflict"
+    q="$(json_field "$(cli "$node" ledger:status --json)" "d['quarantined']")"
+    [ "$q" = 0 ] || fail "$node quarantined $q event(s)"
+done
+
+say "PASS: probes both ways + burst of $BURST; replicated rows converge after a partition (field merge, same-field LWW, delete vs later edit); a unique-title conflict is journaled, announced once, does not block the stream, and converges once resolved"
