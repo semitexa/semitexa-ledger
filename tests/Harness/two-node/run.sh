@@ -14,7 +14,8 @@
 #   6. a replication conflict: apart, both nodes create a row with the same
 #      unique title. After the heal each journals and announces the other's row
 #      once, keeps it out, and the stream still flows past it; renaming one
-#      row (an ordinary replicated write) lets both converge
+#      row (an ordinary replicated write) and retrying the conflict on that
+#      node lets both converge, and both journals close it
 #
 # Usage (from anywhere):
 #   packages/semitexa-ledger/tests/Harness/two-node/run.sh          # run, then tear down
@@ -208,11 +209,14 @@ for pair in "node-a $N5 $N4" "node-b $N4 $N5"; do
         || fail "$node did not announce the conflict on $missing exactly once"
 done
 
-say "   resolve: node-b renames its row; node-a re-sends its own"
+say "   resolve: node-b renames its row, then retries the conflict it holds"
 note node-b set --id=$N5 --field=title --value=DUP-b
-# A row kept out by a conflict is retried when a change of IT arrives, not when
-# the value frees up elsewhere — the resolving side re-sends it.
-note node-a set --id=$N4 --field=body --value=on-A-resolved
+# The rename is a change of N5, so node-a tries N5 again on its own. On node-b
+# nothing about the rename reaches N4: the resolver retries it — nobody on
+# node-a has to touch N4 again.
+r="$(cli node-b harness:note retry --id=$N4)"
+echo "node-b retry: $r"
+[ "$r" = '["resolved"]' ] || fail "node-b's retry of $N4 did not resolve it: $r"
 WAIT_SECONDS="${HEAL_WAIT_SECONDS:-120}" wait_for "both nodes to converge after the resolution" \
     '[ "$(dump node-a)" = "$(dump node-b)" ] && has_row node-a '$N5' && has_row node-b '$N4
 echo "both nodes: $(dump node-a)"
@@ -220,6 +224,7 @@ echo "both nodes: $(dump node-a)"
 for node in node-a node-b; do
     c="$(conflicts "$node")"
     [ "$(json_field "$c" "len(d['announced'])")" = 1 ] || fail "$node announced the conflict again: $c"
+    [ "$(json_field "$c" "[j['row'] for j in d['journaled'] if j['open']]")" = "[]" ] || fail "$node still holds an open conflict: $c"
     cli "$node" ledger:verify >/dev/null || fail "ledger:verify failed on $node after the conflict"
     q="$(json_field "$(cli "$node" ledger:status --json)" "d['quarantined']")"
     [ "$q" = 0 ] || fail "$node quarantined $q event(s)"

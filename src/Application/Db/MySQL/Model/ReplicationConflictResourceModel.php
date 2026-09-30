@@ -60,5 +60,16 @@ final readonly class ReplicationConflictResourceModel
 
         #[Column(type: MySqlType::Datetime)]
         public \DateTimeImmutable $detected_at,
+
+        /**
+         * The change as it arrived, so ReplicationConflicts::retry() can apply
+         * it again; null for a conflict journaled before it was kept
+         */
+        #[Column(type: MySqlType::LongText, nullable: true)]
+        public ?string $payload = null,
+
+        /** When its fields landed here or a newer write superseded them; null while open */
+        #[Column(type: MySqlType::Datetime, nullable: true)]
+        public ?\DateTimeImmutable $resolved_at = null,
     ) {}
 }

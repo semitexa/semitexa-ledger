@@ -139,7 +139,11 @@ final class RowChangeApplier
         }
 
         if ($won === []) {
-            return []; // nothing newer than what is here — including a repeat of this very change
+            // Nothing newer than what is here — including a repeat of this very
+            // change, or a retry whose unapplied field a newer write overtook.
+            ConflictJournal::settle($db, $table, $rowKey, $row !== null);
+
+            return [];
         }
 
         $exists = isset($won[ReplicationCaptureService::EXISTS])
@@ -196,7 +200,7 @@ final class RowChangeApplier
                 // A row cannot exist in part. Nothing of it is kept here — no
                 // clocks either, so a later change of it tries the insert again
                 // once the conflicting value is gone.
-                return $this->journal($db, [$this->conflict($change, $decoded, [], null, $clocks, $e->getMessage())]);
+                return $this->journal($db, $payload, [$this->conflict($change, $decoded, [], null, $clocks, $e->getMessage())]);
             }
             Tombstones::remove($db, $table, $rowKey);
         }
@@ -208,7 +212,11 @@ final class RowChangeApplier
             array_map(static fn (FieldStamp $field): array => [$field->clock->toString(), $field->node], $won),
         );
 
-        return $this->journal($db, $conflicts);
+        $new = $this->journal($db, $payload, $conflicts);
+        // After the journal: a conflict this very change recorded is still open.
+        ConflictJournal::settle($db, $table, $rowKey, $exists);
+
+        return $new;
     }
 
     /**
@@ -298,10 +306,11 @@ final class RowChangeApplier
     }
 
     /**
+     * @param array<mixed> $payload the change as received, kept so it can be retried
      * @param list<ReplicationConflict> $conflicts
      * @return list<ReplicationConflict> the ones recorded for the first time
      */
-    private function journal(DatabaseAdapterInterface $db, array $conflicts): array
+    private function journal(DatabaseAdapterInterface $db, array $payload, array $conflicts): array
     {
         $new = [];
         foreach ($conflicts as $conflict) {
@@ -311,7 +320,7 @@ final class RowChangeApplier
                 'columns' => $conflict->columns,
                 'origin'  => $conflict->originNode,
             ]);
-            if (ConflictJournal::record($db, $conflict)) {
+            if (ConflictJournal::record($db, $conflict, $payload)) {
                 $new[] = $conflict;
             }
         }

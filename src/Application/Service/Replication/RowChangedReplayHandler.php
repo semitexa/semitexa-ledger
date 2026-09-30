@@ -6,8 +6,6 @@ namespace Semitexa\Ledger\Application\Service\Replication;
 
 use Semitexa\Core\Discovery\ClassDiscovery;
 use Semitexa\Core\Event\EventDispatcherInterface;
-use Semitexa\Core\Log\StaticLoggerBridge;
-use Semitexa\Ledger\Application\Payload\Event\ReplicationConflictDetected;
 use Semitexa\Ledger\Attribute\AsReplayHandler;
 use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
@@ -46,18 +44,6 @@ final class RowChangedReplayHandler implements ReplayHandlerInterface
             ->getTransactionManager()
             ->run(static fn (DatabaseAdapterInterface $db): array => $applier->apply($event->payload, $db));
 
-        foreach ($conflicts as $conflict) {
-            try {
-                $this->events?->dispatch(ReplicationConflictDetected::of($conflict));
-            } catch (\Throwable $e) {
-                // The change is applied and the conflict journaled; a failing
-                // listener must not make the replayer apply it again.
-                StaticLoggerBridge::error('ledger', 'A ReplicationConflictDetected listener failed', [
-                    'table' => $conflict->table,
-                    'row'   => $conflict->rowKey,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
+        ConflictAnnouncer::announce($this->events, $conflicts);
     }
 }
