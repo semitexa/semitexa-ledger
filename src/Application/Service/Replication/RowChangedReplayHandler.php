@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service\Replication;
 
 use Semitexa\Core\Discovery\ClassDiscovery;
+use Semitexa\Core\Event\EventDispatcherInterface;
 use Semitexa\Ledger\Attribute\AsReplayHandler;
 use Semitexa\Ledger\Domain\Contract\ReplayHandlerInterface;
 use Semitexa\Ledger\Domain\Model\LedgerEvent;
@@ -18,6 +19,10 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
  * Built by the container's resolve() — the server's replayer and the
  * `ledger:replay` command both reach it that way — so its dependencies arrive
  * through the constructor.
+ *
+ * A change that broke a constraint here is announced as
+ * ReplicationConflictDetected only after its transaction commits: a listener
+ * must never see a conflict the rollback then took back.
  */
 #[AsReplayHandler(domain: ReplicationCaptureService::EVENT_DOMAIN, eventType: ReplicationCaptureService::EVENT_TYPE)]
 final class RowChangedReplayHandler implements ReplayHandlerInterface
@@ -27,14 +32,18 @@ final class RowChangedReplayHandler implements ReplayHandlerInterface
     public function __construct(
         private readonly ConnectionRegistry $connections,
         private readonly ClassDiscovery $discovery,
+        private readonly ?EventDispatcherInterface $events = null,
     ) {}
 
     public function apply(LedgerEvent $event): void
     {
         $applier = $this->applier ??= new RowChangeApplier(ReplicatedTables::discover($this->discovery));
 
-        $this->connections->manager((string) (getenv('LEDGER_DB_CONNECTION') ?: 'default'))
+        /** @var list<\Semitexa\Ledger\Domain\Model\ReplicationConflict> $conflicts */
+        $conflicts = $this->connections->manager((string) (getenv('LEDGER_DB_CONNECTION') ?: 'default'))
             ->getTransactionManager()
-            ->run(static fn (DatabaseAdapterInterface $db) => $applier->apply($event->payload, $db));
+            ->run(static fn (DatabaseAdapterInterface $db): array => $applier->apply($event->payload, $db));
+
+        ConflictAnnouncer::announce($this->events, $conflicts);
     }
 }

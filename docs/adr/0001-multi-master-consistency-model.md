@@ -68,6 +68,24 @@ constraint, the node records a **replication conflict** (both versions, both
 clocks) and dispatches a local event for application code to resolve — for
 example by merging two accounts. The resolution is an ordinary replicated write.
 All fields not involved in the conflict still converge.
+*Implemented 2026-09-29:* the journal is `replication_conflict` (one row per
+conflict, keyed by the unapplied fields' stamps, so replays do not repeat it)
+and the event is `ReplicationConflictDetected`, dispatched once, after the
+partial apply commits. A conflict here means a unique value or a CHECK bound;
+a missing parent or a NOT NULL gap still fails the apply and is retried. An
+unapplied field keeps no clock, so the next change of the row tries it again —
+once the value is free, it lands. A new row that breaks a constraint is not
+created at all: a row cannot exist in part.
+*Retry, 2026-09-30:* a conflict is usually resolved by writing ANOTHER row (the
+one holding the value), and nothing about that write reaches the row kept out.
+The journal keeps the change as received, and `ReplicationConflicts::retry(key)`
+— called by the resolver after its write — applies it again through the same
+merge, so a field a newer write has taken since still loses by its clock. The
+journal closes a conflict itself (`resolved_at`) when the row or its fields
+land, or a newer write overtakes them, whichever path brought that about.
+Chosen over re-trying on every write of the table (cost on the hot path) and a
+periodic sweep (a timer deciding what the application meant): resolution stays
+in application code, as above.
 
 ### 6. Replication is opt-in per resource: `#[Replicated]`
 
