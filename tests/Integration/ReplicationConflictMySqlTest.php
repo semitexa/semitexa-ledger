@@ -169,6 +169,23 @@ final class ReplicationConflictMySqlTest extends TestCase
     }
 
     #[Test]
+    public function a_row_kept_out_and_then_deleted_by_a_newer_change_closes_its_conflict(): void
+    {
+        $this->given(self::ANNA, 'shared@x', 'Anna', 5);
+        $key = $this->apply($this->account(self::CARL, ['shared@x', 200], ['Carl', 200], [1, 200]))[0]->key();
+
+        // A newer change of Carl: deleted on its origin. Nothing of Carl can come back now.
+        $deleted = $this->account(self::CARL, ['shared@x', 200], ['Carl', 200], [1, 200]);
+        $deleted['hlc'] = (new HlcTimestamp(500, 0))->toString();
+        $deleted['exists'] = ['v' => false, 't' => $deleted['hlc'], 'n' => 'node-b'];
+        $this->apply($deleted);
+
+        self::assertNull($this->emailAndName(self::CARL));
+        self::assertSame(0, $this->open(), 'overtaken by a newer delete: resolved');
+        self::assertSame([ConflictRetryOutcome::AlreadyResolved, []], $this->retry($key));
+    }
+
+    #[Test]
     public function a_retry_while_the_value_is_still_taken_keeps_it_open_and_quiet(): void
     {
         $this->given(self::ANNA, 'shared@x', 'Anna', 5);

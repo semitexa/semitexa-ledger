@@ -52,15 +52,17 @@ final class ConflictJournal
 
     /**
      * Close the row's open conflicts that no longer hold: a row kept out now
-     * exists here, or every field left unapplied now carries a clock at least as
-     * new as the one it was journaled with — it landed, or a newer write took
-     * its place. Called by the applier after each change of the row, on its
-     * transaction and under its locks.
+     * exists here, or its existence clock here is at least as new as the one
+     * the kept-out change carried (a newer delete took its place); or every
+     * field left unapplied now carries a clock at least as new as the one it
+     * was journaled with — it landed, or a newer write took its place. Called
+     * by the applier after each change of the row, on its transaction and
+     * under its locks.
      */
     public static function settle(DatabaseAdapterInterface $db, string $table, string $rowKey, bool $rowExists): void
     {
         $open = $db->execute(
-            'SELECT id, columns, incoming FROM replication_conflict WHERE table_name = :t AND row_pk = :pk AND resolved_at IS NULL',
+            'SELECT id, columns, incoming, payload FROM replication_conflict WHERE table_name = :t AND row_pk = :pk AND resolved_at IS NULL',
             ['t' => $table, 'pk' => $rowKey],
         )->rows;
         if ($open === []) {
@@ -74,7 +76,8 @@ final class ConflictJournal
             /** @var list<string> $columns */
             $columns = json_decode($r->string('columns'), true, 8, JSON_THROW_ON_ERROR);
             if ($columns === []) {
-                if ($rowExists) {
+                $clocks ??= FieldClocks::lockAndRead($db, $table, $rowKey);
+                if ($rowExists || self::existenceOvertaken($r->string('payload'), $clocks)) {
                     $settled[] = $r->int('id');
                 }
                 continue;
@@ -115,6 +118,27 @@ final class ConflictJournal
             'payload'  => is_string($payload) ? (array) json_decode($payload, true, 512, JSON_THROW_ON_ERROR) : null,
             'resolved' => ($row['resolved_at'] ?? null) !== null,
         ];
+    }
+
+    /**
+     * Whether this node's existence clock for the row is at least as new as
+     * the one the kept-out change carried. The incoming image holds values
+     * only; the existence stamp is in the change itself. A conflict journaled
+     * before the change was kept ('' here) cannot tell, and stays open.
+     */
+    private static function existenceOvertaken(string $payload, FieldClocks $clocks): bool
+    {
+        $here = $clocks->of(ReplicationCaptureService::EXISTS);
+        if ($payload === '' || $here === null) {
+            return false;
+        }
+
+        $exists = json_decode($payload, true, 512, JSON_THROW_ON_ERROR)['exists'] ?? null;
+        if (!is_array($exists) || !is_string($exists['t'] ?? null)) {
+            return false;
+        }
+
+        return !HlcTimestamp::fromString($exists['t'])->wins((string) ($exists['n'] ?? ''), HlcTimestamp::fromString($here[0]), $here[1]);
     }
 
     /**

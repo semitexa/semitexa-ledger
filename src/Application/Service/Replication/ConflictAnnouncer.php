@@ -23,7 +23,11 @@ final class ConflictAnnouncer
                 $events?->dispatch(ReplicationConflictDetected::of($conflict));
             } catch (\Throwable $e) {
                 // The change is applied and the conflict journaled; a failing
-                // listener must not make the replayer apply it again.
+                // listener must not make the replayer apply it again. What this
+                // hides: the conflict is never announced again — its key is
+                // journaled, so every replay and retry finds it known. It stays
+                // findable as an open row: `replication_conflict` WHERE
+                // resolved_at IS NULL, and this error in the log.
                 StaticLoggerBridge::error('ledger', 'A ReplicationConflictDetected listener failed', [
                     'table' => $conflict->table,
                     'row'   => $conflict->rowKey,
