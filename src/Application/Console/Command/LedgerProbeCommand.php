@@ -94,7 +94,7 @@ final class LedgerProbeCommand extends BaseCommand
                 'event_id' => $event->eventId,
                 'origin'   => $nodeId,
                 'sequence' => $event->sequence,
-            ], JSON_THROW_ON_ERROR));
+            ], JSON_THROW_ON_ERROR), OutputInterface::OUTPUT_RAW);
             return Command::SUCCESS;
         }
 
