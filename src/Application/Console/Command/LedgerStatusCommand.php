@@ -56,7 +56,7 @@ final class LedgerStatusCommand extends Command
         $status = self::collect(new LedgerConnection($dbPath), $nodeId, $input->getOption('probe'));
 
         if ($input->getOption('json') === true) {
-            $output->writeln(json_encode($status, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+            $output->writeln(json_encode($status, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES), OutputInterface::OUTPUT_RAW);
             return Command::SUCCESS;
         }
 
