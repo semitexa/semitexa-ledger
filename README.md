@@ -4,11 +4,16 @@
 
 The package is opt-in at runtime. Keeping it installed in `semitexa/ultimate` no longer forces every app to provide ledger infrastructure immediately.
 
+## Install
+
+Included in every project created by the installer (https://semitexa.com/install.sh).
+
 ## Enable It
 
-Set these environment variables when you want the ledger to boot:
+Set these environment variables when you want the ledger to boot. `EVENTS_ASYNC=1` is required: it turns on async event dispatch and makes `bin/semitexa server:start` add the `docker-compose.nats.yml` overlay, so the NATS server the ledger publishes to actually runs (the default is `EVENTS_ASYNC=0`). Restart the server after changing `.env`.
 
 ```env
+EVENTS_ASYNC=1
 LEDGER_ENABLED=1
 LEDGER_NODE_ID=store-a
 LEDGER_HMAC_KEY=change-me
@@ -106,6 +111,8 @@ The publisher, replayer and command listener run in worker 0 of each server. Set
 
 `CommandBus` is not registered in the container yet: owner-routed commands wait for the ownership design.
 
-## Current Example In This Repo
+## Example
 
-`packages/semitexa-demo/src/Application/Payload/Event/DemoItemCreated.php` and `DemoNotificationEvent.php` are marked with `#[Propagated(domain: 'demo')]` as the first live integration inside this workspace.
+In `semitexa/demo`, `DemoItemCreated` and `DemoNotificationEvent` (`src/Application/Payload/Event/`) are marked with `#[Propagated(domain: 'demo')]`.
+
+Docs: https://semitexa.com/docs/events/ledger
