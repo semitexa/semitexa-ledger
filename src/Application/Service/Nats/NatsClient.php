@@ -212,8 +212,11 @@ final class NatsClient
             $this->client()->setTimeout($timeoutSeconds);
             $timeoutConfigured = true;
 
-            $this->client()->request($subject, $payload, function (string $body) use (&$response): void {
-                $response = $body;
+            // The library passes the reply as a Payload, not a string: typed
+            // `string $body`, every request that got an answer died in a
+            // TypeError, and only the timeout path was ever exercised.
+            $this->client()->request($subject, $payload, function (Payload|string $reply) use (&$response): void {
+                $response = $reply instanceof Payload ? $reply->body : $reply;
             });
         } finally {
             $this->client()->configuration->timeout = $previousTimeout;
@@ -247,7 +250,9 @@ final class NatsClient
             $streamConfig->setMaxAge($config['max_age']);
         }
         if (isset($config['max_bytes'])) {
-            $streamConfig->setMaxBytesPerSubject($config['max_bytes']);
+            // The library has setMaxBytes(); setMaxBytesPerSubject() never
+            // existed, so any stream configured with max_bytes died here.
+            $streamConfig->setMaxBytes($config['max_bytes']);
         }
         if (isset($config['storage'])) {
             $streamConfig->setStorageBackend($config['storage']);
@@ -509,8 +514,11 @@ final class NatsClient
      */
     public function subscribe(string $subject, callable $callback): void
     {
-        $this->client()->subscribe($subject, function (Payload $payload) use ($callback): void {
-            $callback($payload->body, $payload->replyTo, $payload);
+        // The library hands the reply subject over as the handler's SECOND
+        // argument. Payload has no replyTo: reading it through Payload's magic
+        // __get always gave null, so a command never answered its requester.
+        $this->client()->subscribe($subject, function (Payload $payload, ?string $replyTo = null) use ($callback): void {
+            $callback($payload->body, $replyTo, $payload);
         });
     }
 
@@ -519,6 +527,9 @@ final class NatsClient
      */
     public function process(float $timeoutSeconds = 0.0): void
     {
-        $this->client()->process($timeoutSeconds);
+        // reply: false — handlers answer explicitly through publish($replyTo).
+        // Left on, the library also replies with the handler's return value
+        // (null here), and a requester takes whichever arrives first.
+        $this->client()->process($timeoutSeconds, false);
     }
 }
