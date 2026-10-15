@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service;
 
+use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Support\StandingCoroutines;
 use Semitexa\Ledger\Domain\Model\CommandResult;
 
@@ -98,12 +99,11 @@ final class CommandProcessor
         $client->subscribe($wildcardSubject, function (
             string $rawPayload,
             ?string $replyTo,
-        ) use ($client): void {
+        ): ?string {
             $result = $this->processCommandMessage($rawPayload);
 
-            if ($replyTo !== null) {
-                $client->publish($replyTo, $result->toJson());
-            }
+            // Returned, not published: NatsClient sends it as the one reply.
+            return $replyTo !== null ? $result->toJson() : null;
         });
 
         // Process incoming messages in a loop.
@@ -121,7 +121,7 @@ final class CommandProcessor
                     // no point at which the label could truthfully come down.
                     $client->process(1.0);
                 } catch (\Throwable $e) {
-                    error_log('[semitexa-ledger] CommandProcessor error: ' . $e->getMessage());
+                    StaticLoggerBridge::error('ledger', 'CommandProcessor error', ['exception' => $e::class, 'message' => $e->getMessage()]);
                     \Swoole\Coroutine::sleep(1.0);
                 }
             }
@@ -147,7 +147,7 @@ final class CommandProcessor
 
             return $this->handleLocally($command);
         } catch (\Throwable $e) {
-            error_log('[semitexa-ledger] Command processing error: ' . $e->getMessage());
+            StaticLoggerBridge::error('ledger', 'Command processing error', ['exception' => $e::class, 'message' => $e->getMessage()]);
             return CommandResult::error($e->getMessage());
         }
     }

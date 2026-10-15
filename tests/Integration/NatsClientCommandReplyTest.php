@@ -40,11 +40,10 @@ final class NatsClientCommandReplyTest extends TestCase
 
         Coroutine\run(function () use ($subject, &$answer, &$seenReplyTo, &$failure): void {
             $responder = new NatsClient(new ClusterConfig(id: 'responder', url: $this->natsUrl));
-            $responder->subscribe($subject, function (string $body, ?string $replyTo) use ($responder, &$seenReplyTo): void {
+            $responder->subscribe($subject, function (string $body, ?string $replyTo) use (&$seenReplyTo): string {
                 $seenReplyTo = $replyTo;
-                if ($replyTo !== null) {
-                    $responder->publish($replyTo, 'pong:' . $body);
-                }
+
+                return 'pong:' . $body;
             });
             $done = false;
             Coroutine::create(function () use ($responder, &$done): void {
@@ -56,6 +55,10 @@ final class NatsClientCommandReplyTest extends TestCase
             try {
                 $requester = new NatsClient(new ClusterConfig(id: 'requester', url: $this->natsUrl));
                 $answer = $requester->request($subject, 'ping', 3.0);
+                // Exactly one reply: a second, empty one would arrive with no
+                // handler left for it and make this next read throw.
+                Coroutine::sleep(0.3);
+                $requester->process(0.3);
             } catch (\Throwable $e) {
                 $failure = $e;
             } finally {
