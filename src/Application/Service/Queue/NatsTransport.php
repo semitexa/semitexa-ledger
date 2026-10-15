@@ -44,8 +44,18 @@ final class NatsTransport implements QueueTransportInterface
     {
         $this->ensureQueueStream();
         $subject = self::SUBJECT_PREFIX . $queueName;
-        $client  = $this->primaryClient();
-        $client->jetStreamPublish($subject, $payload);
+
+        try {
+            $this->primaryClient()->jetStreamPublish($subject, $payload);
+        } catch (\Throwable) {
+            // A socket that died with a NATS restart fails the first send
+            // ('Error sending data') and the client drops it. Publishers do
+            // not retry — media ingest logged the failure and left the
+            // variant queued forever — so the transport retries once, on the
+            // fresh connection. At-least-once already allows the rare
+            // duplicate if the first attempt reached the server.
+            $this->primaryClient()->jetStreamPublish($subject, $payload);
+        }
     }
 
     public function stop(): void
