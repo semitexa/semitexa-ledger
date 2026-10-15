@@ -119,6 +119,37 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(['after', 'before'], $seen);
     }
 
+    #[Test]
+    public function the_first_publish_on_a_dead_connection_still_reaches_the_queue(): void
+    {
+        // Stream setup (not yet done) is the first call on the dead socket.
+        $seen = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $this->killSocket($transport);
+                $transport->publish($this->queue, 'first');
+
+                $deadline = microtime(true) + 5.0;
+                while ($seen === [] && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$seen): void {
+                        $seen[] = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['first'], $seen);
+    }
+
     private function killSocket(NatsTransport $transport): void
     {
         $natsClient = (new \ReflectionMethod(NatsTransport::class, 'primaryClient'))->invoke($transport);
