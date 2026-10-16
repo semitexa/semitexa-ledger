@@ -510,15 +510,21 @@ final class NatsClient
 
     /**
      * Subscribe to a subject (core NATS, not JetStream). Used by CommandProcessor
-     * to receive commands routed to this node.
+     * to receive commands routed to this node. The callback gets (body,
+     * replyTo, Payload) and returns the reply for a requester, or null.
      */
     public function subscribe(string $subject, callable $callback): void
     {
         // The library hands the reply subject over as the handler's SECOND
-        // argument. Payload has no replyTo: reading it through Payload's magic
-        // __get always gave null, so a command never answered its requester.
-        $this->client()->subscribe($subject, function (Payload $payload, ?string $replyTo = null) use ($callback): void {
-            $callback($payload->body, $replyTo, $payload);
+        // argument (Payload has none: reading it through Payload's magic
+        // __get always gave null). And whatever the handler returns is THE
+        // reply: the library sends it itself whenever the message asked for
+        // one, on every process() path — including the waits inside
+        // request() and jetStreamPublish(), which share this connection. A
+        // handler that published its own answer as well produced a second,
+        // empty reply that a later process() choked on.
+        $this->client()->subscribe($subject, function (Payload $payload, ?string $replyTo = null) use ($callback): mixed {
+            return $callback($payload->body, $replyTo, $payload);
         });
     }
 
@@ -527,9 +533,6 @@ final class NatsClient
      */
     public function process(float $timeoutSeconds = 0.0): void
     {
-        // reply: false — handlers answer explicitly through publish($replyTo).
-        // Left on, the library also replies with the handler's return value
-        // (null here), and a requester takes whichever arrives first.
-        $this->client()->process($timeoutSeconds, false);
+        $this->client()->process($timeoutSeconds);
     }
 }

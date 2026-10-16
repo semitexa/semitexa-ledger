@@ -42,10 +42,30 @@ final class NatsTransport implements QueueTransportInterface
 
     public function publish(string $queueName, string $payload): void
     {
-        $this->ensureQueueStream();
         $subject = self::SUBJECT_PREFIX . $queueName;
-        $client  = $this->primaryClient();
-        $client->jetStreamPublish($subject, $payload);
+
+        // One id for both attempts: JetStream drops a second copy with the
+        // same Nats-Msg-Id inside its duplicate window, so a retry after a
+        // send the server did store (an ack that timed out) cannot deliver a
+        // job twice — a second email, say.
+        $headers = ['Nats-Msg-Id' => 'q-' . bin2hex(random_bytes(16))];
+
+        $attempt = function () use ($subject, $payload, $headers): void {
+            $this->ensureQueueStream();
+            $this->primaryClient()->jetStreamPublish($subject, $payload, $headers);
+        };
+
+        try {
+            $attempt();
+        } catch (\Throwable) {
+            // A socket that died with a NATS restart fails the first call —
+            // the stream setup or the send ('Error sending data'). Publishers
+            // do not retry: media ingest logged the failure and left the
+            // variant queued forever. So the transport drops the socket and
+            // retries once, setup included, on a fresh connection.
+            $this->primaryClient()->reconnect();
+            $attempt();
+        }
     }
 
     public function stop(): void
