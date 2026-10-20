@@ -395,6 +395,81 @@ final class NatsQueueTransportTest extends TestCase
         return (int) $pending;
     }
 
+    /**
+     * ep-queue-monitoring: QueueWorker dead-letters to `<queue>.failed`, which
+     * nothing consumes. The inspector lists those messages (newest first, the
+     * stream sequence as id), queues one again with attempts reset, and
+     * forgets one that was never readable.
+     */
+    #[Test]
+    public function dead_letters_are_listed_retried_into_the_queue_and_forgotten(): void
+    {
+        $result = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$result, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue . '.failed', (string) json_encode([
+                    'type' => 'handler', 'handler' => 'App\\Jobs\\SendInvoice', 'attempts' => 3, 'error' => 'SMTP down', 'failed_at' => '2026-10-21T00:00:00+00:00',
+                ]));
+                $transport->publish($this->queue . '.failed', '{"raw":"x","error":"not a JSON object"}');
+
+                $result['listed'] = $transport->deadLetters($this->queue);
+                $readable = $result['listed'][1];
+                $result['retried'] = $transport->retryDeadLetter($this->queue, $readable->id);
+                $result['retriedTwice'] = $transport->retryDeadLetter($this->queue, $readable->id);
+                $result['forgot'] = $transport->forgetDeadLetter($this->queue, $result['listed'][0]->id);
+                $result['left'] = $transport->deadLetters($this->queue);
+                $result['notOurs'] = $transport->forgetDeadLetter('another-' . $this->queue, $readable->id);
+
+                // Drain for a while: a second copy of the retried job would arrive too.
+                $result['requeued'] = [];
+                $deadline = microtime(true) + 3.0;
+                while (microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$result): void {
+                        $result['requeued'][] = json_decode($payload, true);
+                    });
+                }
+
+                // Letters on both sides of many other messages: the listing
+                // widens its window back from the newest until it holds them.
+                for ($i = 0; $i < 3; $i++) {
+                    $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => "Old{$i}", 'error' => 'e']));
+                }
+                for ($i = 0; $i < 300; $i++) {
+                    $transport->publish($this->queue . '.noise', 'x');
+                }
+                $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => 'Newest', 'error' => 'e']));
+                $result['window'] = array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue, 10));
+                $result['newestOnly'] = array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue, 1));
+                $result['depth'] = $transport->depth($this->queue);
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertCount(2, $result['listed']);
+        self::assertFalse($result['listed'][0]->retryable, 'newest first: the unreadable one was published last');
+        self::assertSame('App\\Jobs\\SendInvoice', $result['listed'][1]->target);
+        self::assertSame('SMTP down', $result['listed'][1]->error);
+        self::assertTrue($result['retried']);
+        self::assertFalse($result['retriedTwice'], 'retried once, then gone');
+        self::assertTrue($result['forgot']);
+        self::assertSame([], $result['left']);
+        self::assertFalse($result['notOurs'], 'a dead letter of another queue is not touched');
+        self::assertCount(1, $result['requeued'], 'the retried job arrives once');
+        self::assertSame(0, $result['requeued'][0]['attempts'] ?? null, 'attempts start over');
+        self::assertSame(['Newest', 'Old2', 'Old1', 'Old0'], $result['window']);
+        self::assertSame(['Newest'], $result['newestOnly']);
+        self::assertArrayNotHasKey('error', $result['requeued'][0]);
+        self::assertSame(0, $result['depth']);
+    }
+
     private function transport(): NatsTransport
     {
         $clusters = new ClusterRegistry();

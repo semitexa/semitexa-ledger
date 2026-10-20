@@ -40,6 +40,8 @@ final class NatsClient
 
     /** JetStream's err_code for an unknown consumer (JSConsumerNotFoundErr). */
     private const CONSUMER_NOT_FOUND = 10014;
+    private const STREAM_NOT_FOUND = 10059;
+    private const NO_MESSAGE_FOUND = 10037;
 
     /** JetStream's err_code for a create that met a consumer of that name (JSConsumerAlreadyExists). */
     private const CONSUMER_EXISTS = 10148;
@@ -575,6 +577,78 @@ final class NatsClient
         if ($consumer->exists()) {
             $consumer->delete();
         }
+    }
+
+    /**
+     * One stored message by sequence, or — with $nextBySubject — the first
+     * message of that subject at or after $seq, or — with $lastBySubject — the
+     * newest message of that subject. Null when there is none; any other error
+     * is thrown, so a walk is never cut short by a hiccup it cannot see.
+     *
+     * Errors are read off the reply: the library's own check reads `->error`
+     * through a magic getter with no __isset, so it never sees one.
+     *
+     * @return array{seq: int, subject: string, data: string, time: string}|null
+     */
+    public function streamMessage(string $streamName, int $seq, ?string $nextBySubject = null, ?string $lastBySubject = null): ?array
+    {
+        $args = $lastBySubject !== null ? ['last_by_subj' => $lastBySubject] : ['seq' => max(1, $seq)];
+        if ($nextBySubject !== null && $lastBySubject === null) {
+            $args['next_by_subj'] = $nextBySubject;
+        }
+        try {
+            $reply = $this->client()->api("STREAM.MSG.GET.{$streamName}", $args);
+        } catch (\Throwable $e) {
+            if (in_array($e->getCode(), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND], true)) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$reply instanceof Payload) {
+            return null;
+        }
+        $error = $reply->getValue('error.err_code');
+        if ($error !== null) {
+            if (in_array(Row::asInt($error), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND], true)) {
+                return null;
+            }
+            throw new \RuntimeException(sprintf('JetStream refused STREAM.MSG.GET on %s: %s', $streamName, Row::asString($reply->getValue('error.description'))), Row::asInt($error));
+        }
+        $data = $reply->getValue('message.data');
+        $decoded = is_string($data) ? base64_decode($data, true) : false;
+
+        return [
+            'seq' => Row::asInt($reply->getValue('message.seq')),
+            'subject' => Row::asString($reply->getValue('message.subject')),
+            'data' => $decoded === false ? '' : $decoded,
+            'time' => Row::asString($reply->getValue('message.time')),
+        ];
+    }
+
+    /**
+     * Messages a durable consumer has not delivered yet, and the stream
+     * sequence it delivered last. Null when there is no such consumer.
+     *
+     * @return array{pending: int, deliveredSeq: int}|null
+     */
+    public function consumerBacklog(string $streamName, string $consumerName): ?array
+    {
+        try {
+            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
+        } catch (\Throwable $e) {
+            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$info instanceof Payload || $info->getValue('error.err_code') !== null) {
+            return null;
+        }
+
+        return [
+            'pending' => self::apiInt($info, 'num_pending'),
+            'deliveredSeq' => self::apiInt($info, 'delivered.stream_seq'),
+        ];
     }
 
     /** Remove a stream and every message in it. Test and operator cleanup. */
