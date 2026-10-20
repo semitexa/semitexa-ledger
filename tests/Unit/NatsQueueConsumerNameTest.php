@@ -32,8 +32,8 @@ final class NatsQueueConsumerNameTest extends TestCase
 
         self::assertSame($names, array_values(array_unique($names)));
         self::assertSame('queue-media-thumbs_' . substr(hash('sha256', 'media.thumbs'), 0, 12), NatsTransport::ownConsumerName('media.thumbs'));
-        // The mapping never produces '_', so an own name is never another queue's first name.
-        self::assertNotContains('_', str_split(NatsTransport::consumerName('a_b')));
+        // The mapping turns '_' into '-', so an own name (with its '_') is never another queue's first name.
+        self::assertSame('queue-a-b', NatsTransport::consumerName('a_b'));
     }
 
     /** NATS refuses a consumer name with '.', '*', '>', whitespace or a path separator. */
