@@ -33,14 +33,161 @@ final class NatsQueueTransportTest extends TestCase
         $this->queue   = 'it' . bin2hex(random_bytes(4));
     }
 
+    /** @var list<string> further consumers a test made, deleted with the queue's own */
+    private array $consumers = [];
+
     protected function tearDown(): void
     {
         if (isset($this->queue, $this->natsUrl)) {
             Coroutine\run(function (): void {
                 $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
-                $client->deleteConsumer('QUEUE', NatsTransport::consumerName($this->queue));
+                foreach ([NatsTransport::consumerName($this->queue), ...$this->consumers] as $consumer) {
+                    $client->deleteConsumer('QUEUE', $consumer);
+                }
             });
         }
+    }
+
+    /**
+     * REGRESSION (tk-nats-consumer-name-collision). The consumer name maps a
+     * queue name onto [a-z0-9-], so media.thumbs and media-thumbs had one
+     * consumer. It keeps the subject it was made with: the second queue's
+     * worker read the first one's jobs, and its own were never read.
+     */
+    #[Test]
+    public function two_queues_the_name_mapping_once_joined_each_read_only_their_own_jobs(): void
+    {
+        $dotted = $this->queue . '.thumbs';
+        $dashed = $this->queue . '-thumbs';
+        $this->consumers = [NatsTransport::consumerName($dotted), NatsTransport::ownConsumerName($dashed), NatsTransport::ownConsumerName($dotted)];
+        $seen = ['dotted' => [], 'dashed' => []];
+        $failure = null;
+
+        Coroutine\run(function () use ($dotted, $dashed, &$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($dotted, 'for-dotted');
+                $transport->publish($dashed, 'for-dashed');
+
+                $deadline = microtime(true) + 5.0;
+                while (($seen['dotted'] === [] || $seen['dashed'] === []) && microtime(true) < $deadline) {
+                    $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                        $seen['dotted'][] = $payload;
+                    });
+                    $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                        $seen['dashed'][] = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['dotted' => ['for-dotted'], 'dashed' => ['for-dashed']], $seen);
+    }
+
+    /**
+     * As the old mapping left it in production: the mapped name was made for
+     * one queue (media.thumbs), and the other queue (media-thumbs) read the
+     * first one's jobs through it. The second queue now reads through a name
+     * of its own; the first keeps its consumer and its place, and runs no job
+     * it already ran.
+     */
+    #[Test]
+    public function a_queue_whose_mapped_name_holds_another_queues_subject_reads_through_its_own(): void
+    {
+        $dotted = $this->queue . '.jobs';
+        $dashed = $this->queue . '-jobs';
+        $this->consumers = [NatsTransport::consumerName($dotted), NatsTransport::ownConsumerName($dashed), NatsTransport::ownConsumerName($dotted)];
+        $seen = ['dotted' => [], 'dashed' => []];
+        $failure = null;
+
+        Coroutine\run(function () use ($dotted, $dashed, &$seen, &$failure): void {
+            try {
+                $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $transport = $this->transport();
+                $transport->publish($dotted, 'dotted-1');
+                // Published while the mapped name read the other queue: never read by anyone.
+                $transport->publish($dashed, 'dashed-0');
+                // The release before: the mapped name made for the dotted queue, dotted-1 run and acked.
+                $client->ensurePullConsumer('QUEUE', NatsTransport::consumerName($dotted), 'semitexa.queue.' . $dotted);
+                $deadline = microtime(true) + 5.0;
+                do {
+                    $first = $client->pullMessages('QUEUE', NatsTransport::consumerName($dotted), 1);
+                } while ($first === [] && microtime(true) < $deadline);
+                self::assertSame(['dotted-1'], array_map(static fn ($m): string => $m->body, $first));
+                $first[0]->ack();
+                $transport->publish($dotted, 'dotted-2');
+                $transport->publish($dashed, 'dashed-1');
+
+                $deadline = microtime(true) + 5.0;
+                while ((count($seen['dotted']) < 1 || count($seen['dashed']) < 2) && microtime(true) < $deadline) {
+                    $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                        $seen['dashed'][] = $payload;
+                    });
+                    $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                        $seen['dotted'][] = $payload;
+                    });
+                }
+                // One more pull each: nothing already run comes again.
+                $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                    $seen['dotted'][] = $payload;
+                });
+                $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                    $seen['dashed'][] = $payload;
+                });
+                $seen['own'] = $client->consumerState('QUEUE', NatsTransport::ownConsumerName($dashed))['filterSubject'] ?? null;
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['dotted' => ['dotted-2'], 'dashed' => ['dashed-0', 'dashed-1'], 'own' => 'semitexa.queue.' . $dashed], $seen);
+    }
+
+    /**
+     * Two queues' workers that create the mapped name at once: the second
+     * create must leave the first one's consumer as it is. The legacy create
+     * pointed it at the second queue's subject and answered ok, and both
+     * queues ended on one consumer again (review, reproduced on NATS 2.12).
+     */
+    #[Test]
+    public function a_create_that_meets_a_consumer_of_another_subject_leaves_it_as_it_was(): void
+    {
+        $name = NatsTransport::consumerName($this->queue . '.race');
+        $this->consumers = [$name];
+        $result = null;
+        $failure = null;
+
+        Coroutine\run(function () use ($name, &$result, &$failure): void {
+            try {
+                $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $client->ensureStream('QUEUE', ['subjects' => ['semitexa.queue.>']]);
+                // The other worker looked first and saw no consumer (its library remembers that).
+                $otherWorker = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $otherWorker->deleteConsumer('QUEUE', $name);
+                $first = $client->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '.race', 300.0, 5);
+                $again = $client->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '.race', 300.0, 5);
+                $other = $otherWorker->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '-race', 300.0, 5);
+                $result = [$first, $again, $other, $client->consumerState('QUEUE', $name)['filterSubject'] ?? null];
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame([true, true, false, 'semitexa.queue.' . $this->queue . '.race'], $result);
     }
 
     #[Test]

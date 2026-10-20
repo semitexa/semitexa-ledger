@@ -38,6 +38,12 @@ final class NatsClient
     /** Seconds of empty pulls after which the connection is proven alive. */
     private const LIVENESS_AFTER = 10.0;
 
+    /** JetStream's err_code for an unknown consumer (JSConsumerNotFoundErr). */
+    private const CONSUMER_NOT_FOUND = 10014;
+
+    /** JetStream's err_code for a create that met a consumer of that name (JSConsumerAlreadyExists). */
+    private const CONSUMER_EXISTS = 10148;
+
     /** When this connection last showed it was alive (a delivery or a PONG). */
     private float $aliveAt;
 
@@ -488,6 +494,78 @@ final class NatsClient
     private static function apiInt(mixed $reply, string $path): int
     {
         return $reply instanceof Payload ? Row::asInt($reply->getValue($path)) : 0;
+    }
+
+    /**
+     * What a durable consumer reads and how far it got: its filter subject and
+     * the stream sequence of the last message acknowledged with every one
+     * before it (0 when none was). Null when there is no such consumer.
+     *
+     * @return array{filterSubject: string, ackFloor: int}|null
+     */
+    public function consumerState(string $streamName, string $consumerName): ?array
+    {
+        // Asked of the server, not the library's Consumer::exists(): that one
+        // answers from what this client saw, and another worker may have
+        // deleted the consumer since.
+        try {
+            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
+        } catch (\Throwable $e) {
+            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$info instanceof Payload) {
+            return null;
+        }
+        $filter = $info->getValue('config.filter_subject');
+
+        return [
+            'filterSubject' => is_string($filter) ? $filter : '',
+            'ackFloor'      => self::apiInt($info, 'ack_floor.stream_seq'),
+        ];
+    }
+
+    /**
+     * Create a durable pull consumer only where no consumer has that name.
+     * True when the name now reads $filterSubject: made here, or by another
+     * worker with the same settings meanwhile. False when it holds another one.
+     *
+     * Not {@see ensurePullConsumer()}: its legacy DURABLE.CREATE, on a name
+     * that exists with another filter subject, points that consumer at the new
+     * subject and answers ok (measured on NATS 2.12). Two queues whose workers
+     * created one name at once ended on one consumer again. CONSUMER.CREATE
+     * with action=create refuses instead (10148) and leaves it as it was.
+     */
+    public function createPullConsumerIfAbsent(
+        string $streamName,
+        string $consumerName,
+        string $filterSubject,
+        float $ackWaitSeconds,
+        int $maxDeliver,
+    ): bool {
+        try {
+            $this->client()->api("CONSUMER.CREATE.{$streamName}.{$consumerName}", [
+                'stream_name' => $streamName,
+                'config'      => [
+                    'durable_name'   => $consumerName,
+                    'filter_subject' => $filterSubject,
+                    'ack_policy'     => 'explicit',
+                    'deliver_policy' => 'all',
+                    'replay_policy'  => 'instant',
+                    'ack_wait'       => (int) ($ackWaitSeconds * 1_000_000_000),
+                    'max_deliver'    => $maxDeliver,
+                ],
+                'action'      => 'create',
+            ]);
+        } catch (\Throwable $e) {
+            if ($e->getCode() !== self::CONSUMER_EXISTS) {
+                throw $e;
+            }
+        }
+
+        return ($this->consumerState($streamName, $consumerName)['filterSubject'] ?? null) === $filterSubject;
     }
 
     /** Remove a durable consumer. Test and operator cleanup. */

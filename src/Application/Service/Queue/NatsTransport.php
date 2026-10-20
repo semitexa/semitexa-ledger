@@ -32,8 +32,8 @@ final class NatsTransport implements QueueTransportInterface
     /** Cleared by stop() to end consume() after the current batch. */
     private bool $running = true;
 
-    /** @var array<string, true> */
-    private array $consumerReady = [];
+    /** @var array<string, string> queue name => the consumer it is read through */
+    private array $consumerNames = [];
 
     public function __construct(
         private readonly ClusterRegistry $clusters,
@@ -99,19 +99,8 @@ final class NatsTransport implements QueueTransportInterface
     {
         $this->ensureQueueStream();
         $subject      = self::SUBJECT_PREFIX . $queueName;
-        $consumerName = self::consumerName($queueName);
         $client       = $this->primaryClient();
-
-        if (!isset($this->consumerReady[$consumerName])) {
-            $client->ensurePullConsumer(
-                streamName:     self::STREAM_NAME,
-                consumerName:   $consumerName,
-                filterSubject:  $subject,
-                ackWaitSeconds: self::ACK_WAIT,
-                maxDeliver:     self::MAX_DELIVER,
-            );
-            $this->consumerReady[$consumerName] = true;
-        }
+        $consumerName = $this->consumerFor($client, $queueName, $subject);
 
         $messages = $client->pullMessages(
             streamName:   self::STREAM_NAME,
@@ -146,9 +135,82 @@ final class NatsTransport implements QueueTransportInterface
         return count($messages);
     }
 
+    /**
+     * The name a queue's durable consumer is looked for under first: the queue
+     * name mapped onto [a-z0-9-], as every queue's consumer has always been
+     * named. The mapping can join two queues (Mail and mail, media.thumbs and
+     * media-thumbs); {@see consumerFor()} then gives the second one
+     * {@see ownConsumerName()}.
+     */
     public static function consumerName(string $queueName): string
     {
         return 'queue-' . preg_replace('/[^a-z0-9-]/', '-', strtolower($queueName));
+    }
+
+    /**
+     * A name only this queue maps to: the mapped name, then a hash of the
+     * queue name after a character the mapping never produces.
+     */
+    public static function ownConsumerName(string $queueName): string
+    {
+        return self::consumerName($queueName) . '_' . substr(hash('sha256', $queueName), 0, 12);
+    }
+
+    /**
+     * The consumer this queue is read through. A consumer keeps the subject it
+     * was made with, so when the mapped name holds another queue's subject,
+     * reading through it took that queue's jobs and left this one's unread:
+     * the queue then uses its own name instead. A consumer that is this
+     * queue's own keeps its name and its place, whatever other queues do, and
+     * nothing is ever moved or deleted here. A name that is free is created
+     * only if it still is ({@see NatsClient::createPullConsumerIfAbsent()}), so
+     * two queues' workers that reach it at once cannot share it.
+     *
+     * The choice holds as long as the consumers do: delete the one under the
+     * mapped name, and the next queue to start takes it from the stream's
+     * first message, while the queue that had it moves to its own name and
+     * starts there too. Both then run their jobs again.
+     */
+    private function consumerFor(\Semitexa\Ledger\Application\Service\Nats\NatsClient $client, string $queueName, string $subject): string
+    {
+        if (isset($this->consumerNames[$queueName])) {
+            return $this->consumerNames[$queueName];
+        }
+
+        foreach ([self::consumerName($queueName), self::ownConsumerName($queueName)] as $candidate) {
+            $state = $client->consumerState(self::STREAM_NAME, $candidate);
+            if ($state === null) {
+                if (!$client->createPullConsumerIfAbsent(self::STREAM_NAME, $candidate, $subject, self::ACK_WAIT, self::MAX_DELIVER)) {
+                    continue;
+                }
+            } elseif ($state['filterSubject'] !== $subject) {
+                continue;
+            } else {
+                // Ours already: same subject, so this only brings its settings up to date.
+                $client->ensurePullConsumer(
+                    streamName:     self::STREAM_NAME,
+                    consumerName:   $candidate,
+                    filterSubject:  $subject,
+                    ackWaitSeconds: self::ACK_WAIT,
+                    maxDeliver:     self::MAX_DELIVER,
+                );
+            }
+            if ($candidate !== self::consumerName($queueName)) {
+                StaticLoggerBridge::info('queue', 'NATS queue reads through a consumer of its own: its mapped name belongs to another queue', [
+                    'queue'    => $queueName,
+                    'consumer' => $candidate,
+                ]);
+            }
+
+            return $this->consumerNames[$queueName] = $candidate;
+        }
+
+        throw new \RuntimeException(sprintf(
+            "NATS consumers '%s' and '%s' both read another subject than '%s': delete or rename the one that is not a queue's.",
+            self::consumerName($queueName),
+            self::ownConsumerName($queueName),
+            $subject,
+        ));
     }
 
     private function primaryClient(): \Semitexa\Ledger\Application\Service\Nats\NatsClient
