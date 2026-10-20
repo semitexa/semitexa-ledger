@@ -427,6 +427,7 @@ final class NatsClient
                 ack:            static fn () => $msg->ack(),
                 nak:            static fn (float $delay) => $msg->nack($delay),
                 deliveryCount:  PulledMessage::deliveryCountFromReplyTo($msg->replyTo),
+                notBeforeMs:    (int) ($msg->payload->getHeader(PulledMessage::NOT_BEFORE_HEADER) ?? 0),
             );
         }
 

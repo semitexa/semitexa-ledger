@@ -5,8 +5,9 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Service\Queue;
 
 use Semitexa\Core\Log\StaticLoggerBridge;
-use Semitexa\Core\Queue\QueueTransportInterface;
+use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
+use Semitexa\Ledger\Application\Service\Nats\PulledMessage;
 
 /**
  * NATS JetStream implementation of the existing QueueTransportInterface.
@@ -17,7 +18,7 @@ use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
  * Messages are published to JetStream (stream must be configured to capture
  * `semitexa.queue.>` subjects). Consumers are created per queue name.
  */
-final class NatsTransport implements QueueTransportInterface, \Semitexa\Core\Queue\QueueInspectorInterface
+final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\Core\Queue\QueueInspectorInterface
 {
     private const SUBJECT_PREFIX = 'semitexa.queue.';
     private const STREAM_NAME    = 'QUEUE';
@@ -25,6 +26,9 @@ final class NatsTransport implements QueueTransportInterface, \Semitexa\Core\Que
     private const ACK_WAIT    = 300.0;
     /** Deliveries before a failing message stops being redelivered — the database transport's max_attempts. */
     private const MAX_DELIVER = 5;
+
+    /** A redelivery a little before its due time is due: a second nak would spend a delivery for nothing. */
+    private const DUE_TOLERANCE_MS = 250;
     private const RETRY_DELAY = 5.0;
 
     /** Dead letters looked at per listing, at most: each is one request to the server. */
@@ -45,13 +49,31 @@ final class NatsTransport implements QueueTransportInterface, \Semitexa\Core\Que
 
     public function publish(string $queueName, string $payload): void
     {
+        $this->send($queueName, $payload, []);
+    }
+
+    /**
+     * JetStream cannot hold a message back on publish. It is stored now with
+     * the time it is due; the consumer that pulls it early hands it back
+     * with a nak for the time that remains, and that costs one delivery.
+     */
+    public function publishDelayed(string $queueName, string $payload, int $delaySeconds): void
+    {
+        $this->send($queueName, $payload, [
+            PulledMessage::NOT_BEFORE_HEADER => (string) ((int) floor(microtime(true) * 1000) + max(0, $delaySeconds) * 1000),
+        ]);
+    }
+
+    /** @param array<string, string> $extraHeaders */
+    private function send(string $queueName, string $payload, array $extraHeaders): void
+    {
         $subject = self::SUBJECT_PREFIX . $queueName;
 
         // One id for both attempts: JetStream drops a second copy with the
         // same Nats-Msg-Id inside its duplicate window, so a retry after a
         // send the server did store (an ack that timed out) cannot deliver a
         // job twice — a second email, say.
-        $headers = ['Nats-Msg-Id' => 'q-' . bin2hex(random_bytes(16))];
+        $headers = ['Nats-Msg-Id' => 'q-' . bin2hex(random_bytes(16))] + $extraHeaders;
 
         $attempt = function () use ($subject, $payload, $headers): void {
             $this->ensureQueueStream();
@@ -112,6 +134,19 @@ final class NatsTransport implements QueueTransportInterface, \Semitexa\Core\Que
         );
 
         foreach ($messages as $msg) {
+            $early = $msg->notBeforeMs - (int) floor(microtime(true) * 1000);
+            // On its last delivery a message is run, early or not: a nak there
+            // would be the end of it, with nothing logged.
+            if ($early > self::DUE_TOLERANCE_MS && $msg->deliveryCount < self::MAX_DELIVER) {
+                // A delayed retry, pulled before it is due: back to the stream
+                // for the time that remains. Whole seconds, rounded up: the
+                // client sends seconds × 10⁹, and a fraction such as 0.267 s
+                // comes out as 267000000.00000003 ns, which the server refuses
+                // and treats as a plain nak — straight back, a delivery spent.
+                $msg->nak((float) (int) ceil($early / 1000));
+                continue;
+            }
+
             try {
                 $callback($msg->body);
             } catch (\Throwable $e) {

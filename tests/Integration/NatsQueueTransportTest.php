@@ -307,6 +307,43 @@ final class NatsQueueTransportTest extends TestCase
     }
 
     #[Test]
+    public function a_delayed_job_is_handled_once_it_is_due_and_does_not_hold_up_the_rest(): void
+    {
+        // The worker used to sleep a retry's delay inside the consume loop.
+        $seen = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $published = microtime(true);
+                $transport->publishDelayed($this->queue, 'retry', 3);
+                $transport->publish($this->queue, 'fresh');
+
+                $deadline = microtime(true) + 10.0;
+                while (count($seen) < 2 && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$seen, $published): void {
+                        $seen[] = [$payload, microtime(true) - $published];
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['fresh', 'retry'], array_column($seen, 0));
+        // A pull waits up to ~1.5 s for its batch; the fresh job is handled by
+        // the first one, long before the delayed job is due.
+        self::assertLessThan(2.5, $seen[0][1], 'the fresh job waited for the delayed one');
+        self::assertGreaterThanOrEqual(2.75, $seen[1][1], 'the delayed job was handled before it was due');
+        self::assertSame(0, $this->pendingAcks());
+    }
+
+    #[Test]
     public function a_job_with_an_empty_body_reaches_the_handler_and_is_acked(): void
     {
         $seen = null;
