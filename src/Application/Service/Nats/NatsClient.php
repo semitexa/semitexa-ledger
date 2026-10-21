@@ -118,6 +118,12 @@ final class NatsClient
         return new Client(new Configuration($this->options));
     }
 
+    /** This cluster's JetStream API, for stream administration (QueueStreamMaxAge). */
+    public function jetStream(): \Basis\Nats\Api
+    {
+        return $this->client()->getApi();
+    }
+
     private function client(): Client
     {
         return $this->client ??= $this->newClient();

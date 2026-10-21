@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Queue;
 
+use Semitexa\Core\Environment;
 use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Ledger\Application\Service\Nats\ClusterRegistry;
 use Semitexa\Ledger\Application\Service\Nats\PulledMessage;
+use Semitexa\Ledger\Application\Service\Nats\StreamMaxAge;
 
 /**
  * NATS JetStream implementation of the existing QueueTransportInterface.
@@ -434,15 +436,44 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         return $clusters[0]['client'];
     }
 
+    /**
+     * NATS_QUEUE_MAX_AGE_DAYS as JetStream's nanoseconds: 14 days unless set,
+     * 0 = forever. Anything but whole days (a typo, a negative number) keeps
+     * the 14: read as 0 it would keep every message, the opposite of what
+     * was meant. At most 36500 days, or the nanoseconds overflow an int.
+     */
+    public static function maxAgeNanoSeconds(?string $days): int
+    {
+        $days = trim((string) $days);
+        $days = ctype_digit($days) ? min(36_500, (int) $days) : 14;
+
+        return $days * 86_400 * 1_000_000_000;
+    }
+
     private function ensureQueueStream(): void
     {
         if ($this->streamReady) {
             return;
         }
 
-        $this->primaryClient()->ensureStream(self::STREAM_NAME, [
+        // Every message, acked or dead-lettered, is kept NATS_QUEUE_MAX_AGE_DAYS
+        // (14 by default; 0 keeps them forever): with no limit the stream kept
+        // every job ever queued until the disk was full. A dead letter on
+        // <queue>.failed expires the same way, so queue:failed sees that long.
+        $maxAge = self::maxAgeNanoSeconds(Environment::getEnvValue('NATS_QUEUE_MAX_AGE_DAYS'));
+        $client = $this->primaryClient();
+        $client->ensureStream(self::STREAM_NAME, [
             'subjects' => [self::SUBJECT_PREFIX . '>'],
+            'max_age' => $maxAge,
         ]);
+        try {
+            StreamMaxAge::ensure($client, self::STREAM_NAME, $maxAge);
+        } catch (\Throwable $e) {
+            // The queue still works on a stream whose age could not be set.
+            StaticLoggerBridge::warning('NATS QUEUE stream: its max age could not be set; it keeps every message', [
+                'error' => $e->getMessage(),
+            ]);
+        }
 
         $this->streamReady = true;
     }
