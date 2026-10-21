@@ -507,6 +507,52 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(0, $result['depth']);
     }
 
+    /**
+     * Stopped (SIGTERM) on the first message of a batch: the rest of the batch
+     * must not run here, past the stop, nor wait out ACK_WAIT (300 s) — they
+     * go back to the stream at once, for the next worker.
+     */
+    #[Test]
+    public function a_stop_mid_batch_hands_the_rest_back_at_once(): void
+    {
+        $ran = ['stopped' => [], 'next' => []];
+        $failure = null;
+
+        Coroutine\run(function () use (&$ran, &$failure): void {
+            try {
+                $transport = $this->transport();
+                foreach (['a', 'b', 'c'] as $payload) {
+                    $transport->publish($this->queue, $payload);
+                }
+                $deadline = microtime(true) + 5.0;
+                while ($ran['stopped'] === [] && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use ($transport, &$ran): void {
+                        $ran['stopped'][] = $payload;
+                        $transport->stop();
+                    });
+                }
+
+                $next = $this->transport();
+                $deadline = microtime(true) + 5.0;
+                while (count($ran['stopped']) + count($ran['next']) < 3 && microtime(true) < $deadline) {
+                    $next->consumeBatch($this->queue, static function (string $payload) use (&$ran): void {
+                        $ran['next'][] = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+        self::assertCount(1, $ran['stopped'], 'nothing ran after the stop');
+        $all = [...$ran['stopped'], ...$ran['next']];
+        sort($all);
+        self::assertSame(['a', 'b', 'c'], $all, 'the rest reached the next worker within seconds, each once');
+    }
+
     private function transport(): NatsTransport
     {
         $clusters = new ClusterRegistry();

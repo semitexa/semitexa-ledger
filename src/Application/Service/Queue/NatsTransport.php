@@ -20,7 +20,7 @@ use Semitexa\Ledger\Application\Service\Nats\StreamMaxAge;
  * Messages are published to JetStream (stream must be configured to capture
  * `semitexa.queue.>` subjects). Consumers are created per queue name.
  */
-final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\Core\Queue\QueueInspectorInterface
+final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\Core\Queue\QueueInspectorInterface, \Semitexa\Core\Queue\StoppableQueueTransportInterface
 {
     private const SUBJECT_PREFIX = 'semitexa.queue.';
     private const STREAM_NAME    = 'QUEUE';
@@ -129,13 +129,38 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         $client       = $this->primaryClient();
         $consumerName = $this->consumerFor($client, $queueName, $subject);
 
-        $messages = $client->pullMessages(
-            streamName:   self::STREAM_NAME,
-            consumerName: $consumerName,
-            batchSize:    10,
-        );
+        // A stop signal (QueueStopSignals) landing while the library waits in
+        // stream_select() makes it return false, which the library takes as
+        // "nothing yet"; PHP also warns "Interrupted system call". Only that
+        // warning is dropped, and only here; any other goes to the handler
+        // that was there.
+        $previous = null;
+        $previous = set_error_handler(static function (int $no, string $message, string $file = '', int $line = 0) use (&$previous): bool {
+            if (str_contains($message, 'Interrupted system call')) {
+                return true;
+            }
+
+            return $previous !== null && (bool) $previous($no, $message, $file, $line);
+        }, E_WARNING);
+        try {
+            $messages = $client->pullMessages(
+                streamName:   self::STREAM_NAME,
+                consumerName: $consumerName,
+                batchSize:    10,
+            );
+        } finally {
+            restore_error_handler();
+        }
 
         foreach ($messages as $msg) {
+            if (!$this->running) {
+                // Stopped (SIGTERM) in the middle of a batch: the rest are
+                // already delivered to this worker. Back to the stream at
+                // once, for another replica or the next start, rather than
+                // run here past the stop or left for ACK_WAIT.
+                $msg->nak(0.0);
+                continue;
+            }
             $early = $msg->notBeforeMs - (int) floor(microtime(true) * 1000);
             // On its last delivery a message is run, early or not: a nak there
             // would be the end of it, with nothing logged.
@@ -470,7 +495,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
             StreamMaxAge::ensure($client, self::STREAM_NAME, $maxAge);
         } catch (\Throwable $e) {
             // The queue still works on a stream whose age could not be set.
-            StaticLoggerBridge::warning('NATS QUEUE stream: its max age could not be set; it keeps every message', [
+            StaticLoggerBridge::warning('queue', 'NATS QUEUE stream: its max age could not be set; it keeps every message', [
                 'error' => $e->getMessage(),
             ]);
         }
