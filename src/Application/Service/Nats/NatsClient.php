@@ -38,6 +38,14 @@ final class NatsClient
     /** Seconds of empty pulls after which the connection is proven alive. */
     private const LIVENESS_AFTER = 10.0;
 
+    /** JetStream's err_code for an unknown consumer (JSConsumerNotFoundErr). */
+    private const CONSUMER_NOT_FOUND = 10014;
+    private const STREAM_NOT_FOUND = 10059;
+    private const NO_MESSAGE_FOUND = 10037;
+
+    /** JetStream's err_code for a create that met a consumer of that name (JSConsumerAlreadyExists). */
+    private const CONSUMER_EXISTS = 10148;
+
     /** When this connection last showed it was alive (a delivery or a PONG). */
     private float $aliveAt;
 
@@ -108,6 +116,12 @@ final class NatsClient
         // accepts at runtime though its docblock types only scalars.
         /** @phpstan-ignore argument.type */
         return new Client(new Configuration($this->options));
+    }
+
+    /** This cluster's JetStream API, for stream administration (QueueStreamMaxAge). */
+    public function jetStream(): \Basis\Nats\Api
+    {
+        return $this->client()->getApi();
     }
 
     private function client(): Client
@@ -419,6 +433,7 @@ final class NatsClient
                 ack:            static fn () => $msg->ack(),
                 nak:            static fn (float $delay) => $msg->nack($delay),
                 deliveryCount:  PulledMessage::deliveryCountFromReplyTo($msg->replyTo),
+                notBeforeMs:    (int) ($msg->payload->getHeader(PulledMessage::NOT_BEFORE_HEADER) ?? 0),
             );
         }
 
@@ -490,6 +505,78 @@ final class NatsClient
         return $reply instanceof Payload ? Row::asInt($reply->getValue($path)) : 0;
     }
 
+    /**
+     * What a durable consumer reads and how far it got: its filter subject and
+     * the stream sequence of the last message acknowledged with every one
+     * before it (0 when none was). Null when there is no such consumer.
+     *
+     * @return array{filterSubject: string, ackFloor: int}|null
+     */
+    public function consumerState(string $streamName, string $consumerName): ?array
+    {
+        // Asked of the server, not the library's Consumer::exists(): that one
+        // answers from what this client saw, and another worker may have
+        // deleted the consumer since.
+        try {
+            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
+        } catch (\Throwable $e) {
+            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$info instanceof Payload) {
+            return null;
+        }
+        $filter = $info->getValue('config.filter_subject');
+
+        return [
+            'filterSubject' => is_string($filter) ? $filter : '',
+            'ackFloor'      => self::apiInt($info, 'ack_floor.stream_seq'),
+        ];
+    }
+
+    /**
+     * Create a durable pull consumer only where no consumer has that name.
+     * True when the name now reads $filterSubject: made here, or by another
+     * worker with the same settings meanwhile. False when it holds another one.
+     *
+     * Not {@see ensurePullConsumer()}: its legacy DURABLE.CREATE, on a name
+     * that exists with another filter subject, points that consumer at the new
+     * subject and answers ok (measured on NATS 2.12). Two queues whose workers
+     * created one name at once ended on one consumer again. CONSUMER.CREATE
+     * with action=create refuses instead (10148) and leaves it as it was.
+     */
+    public function createPullConsumerIfAbsent(
+        string $streamName,
+        string $consumerName,
+        string $filterSubject,
+        float $ackWaitSeconds,
+        int $maxDeliver,
+    ): bool {
+        try {
+            $this->client()->api("CONSUMER.CREATE.{$streamName}.{$consumerName}", [
+                'stream_name' => $streamName,
+                'config'      => [
+                    'durable_name'   => $consumerName,
+                    'filter_subject' => $filterSubject,
+                    'ack_policy'     => 'explicit',
+                    'deliver_policy' => 'all',
+                    'replay_policy'  => 'instant',
+                    'ack_wait'       => (int) ($ackWaitSeconds * 1_000_000_000),
+                    'max_deliver'    => $maxDeliver,
+                ],
+                'action'      => 'create',
+            ]);
+        } catch (\Throwable $e) {
+            if ($e->getCode() !== self::CONSUMER_EXISTS) {
+                throw $e;
+            }
+        }
+
+        return ($this->consumerState($streamName, $consumerName)['filterSubject'] ?? null) === $filterSubject;
+    }
+
     /** Remove a durable consumer. Test and operator cleanup. */
     public function deleteConsumer(string $streamName, string $consumerName): void
     {
@@ -497,6 +584,78 @@ final class NatsClient
         if ($consumer->exists()) {
             $consumer->delete();
         }
+    }
+
+    /**
+     * One stored message by sequence, or — with $nextBySubject — the first
+     * message of that subject at or after $seq, or — with $lastBySubject — the
+     * newest message of that subject. Null when there is none; any other error
+     * is thrown, so a walk is never cut short by a hiccup it cannot see.
+     *
+     * Errors are read off the reply: the library's own check reads `->error`
+     * through a magic getter with no __isset, so it never sees one.
+     *
+     * @return array{seq: int, subject: string, data: string, time: string}|null
+     */
+    public function streamMessage(string $streamName, int $seq, ?string $nextBySubject = null, ?string $lastBySubject = null): ?array
+    {
+        $args = $lastBySubject !== null ? ['last_by_subj' => $lastBySubject] : ['seq' => max(1, $seq)];
+        if ($nextBySubject !== null && $lastBySubject === null) {
+            $args['next_by_subj'] = $nextBySubject;
+        }
+        try {
+            $reply = $this->client()->api("STREAM.MSG.GET.{$streamName}", $args);
+        } catch (\Throwable $e) {
+            if (in_array($e->getCode(), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND], true)) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$reply instanceof Payload) {
+            return null;
+        }
+        $error = $reply->getValue('error.err_code');
+        if ($error !== null) {
+            if (in_array(Row::asInt($error), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND], true)) {
+                return null;
+            }
+            throw new \RuntimeException(sprintf('JetStream refused STREAM.MSG.GET on %s: %s', $streamName, Row::asString($reply->getValue('error.description'))), Row::asInt($error));
+        }
+        $data = $reply->getValue('message.data');
+        $decoded = is_string($data) ? base64_decode($data, true) : false;
+
+        return [
+            'seq' => Row::asInt($reply->getValue('message.seq')),
+            'subject' => Row::asString($reply->getValue('message.subject')),
+            'data' => $decoded === false ? '' : $decoded,
+            'time' => Row::asString($reply->getValue('message.time')),
+        ];
+    }
+
+    /**
+     * Messages a durable consumer has not delivered yet, and the stream
+     * sequence it delivered last. Null when there is no such consumer.
+     *
+     * @return array{pending: int, deliveredSeq: int}|null
+     */
+    public function consumerBacklog(string $streamName, string $consumerName): ?array
+    {
+        try {
+            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
+        } catch (\Throwable $e) {
+            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
+                return null;
+            }
+            throw $e;
+        }
+        if (!$info instanceof Payload || $info->getValue('error.err_code') !== null) {
+            return null;
+        }
+
+        return [
+            'pending' => self::apiInt($info, 'num_pending'),
+            'deliveredSeq' => self::apiInt($info, 'delivered.stream_seq'),
+        ];
     }
 
     /** Remove a stream and every message in it. Test and operator cleanup. */

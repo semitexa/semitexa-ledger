@@ -33,14 +33,161 @@ final class NatsQueueTransportTest extends TestCase
         $this->queue   = 'it' . bin2hex(random_bytes(4));
     }
 
+    /** @var list<string> further consumers a test made, deleted with the queue's own */
+    private array $consumers = [];
+
     protected function tearDown(): void
     {
         if (isset($this->queue, $this->natsUrl)) {
             Coroutine\run(function (): void {
                 $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
-                $client->deleteConsumer('QUEUE', NatsTransport::consumerName($this->queue));
+                foreach ([NatsTransport::consumerName($this->queue), ...$this->consumers] as $consumer) {
+                    $client->deleteConsumer('QUEUE', $consumer);
+                }
             });
         }
+    }
+
+    /**
+     * REGRESSION (tk-nats-consumer-name-collision). The consumer name maps a
+     * queue name onto [a-z0-9-], so media.thumbs and media-thumbs had one
+     * consumer. It keeps the subject it was made with: the second queue's
+     * worker read the first one's jobs, and its own were never read.
+     */
+    #[Test]
+    public function two_queues_the_name_mapping_once_joined_each_read_only_their_own_jobs(): void
+    {
+        $dotted = $this->queue . '.thumbs';
+        $dashed = $this->queue . '-thumbs';
+        $this->consumers = [NatsTransport::consumerName($dotted), NatsTransport::ownConsumerName($dashed), NatsTransport::ownConsumerName($dotted)];
+        $seen = ['dotted' => [], 'dashed' => []];
+        $failure = null;
+
+        Coroutine\run(function () use ($dotted, $dashed, &$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($dotted, 'for-dotted');
+                $transport->publish($dashed, 'for-dashed');
+
+                $deadline = microtime(true) + 5.0;
+                while (($seen['dotted'] === [] || $seen['dashed'] === []) && microtime(true) < $deadline) {
+                    $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                        $seen['dotted'][] = $payload;
+                    });
+                    $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                        $seen['dashed'][] = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['dotted' => ['for-dotted'], 'dashed' => ['for-dashed']], $seen);
+    }
+
+    /**
+     * As the old mapping left it in production: the mapped name was made for
+     * one queue (media.thumbs), and the other queue (media-thumbs) read the
+     * first one's jobs through it. The second queue now reads through a name
+     * of its own; the first keeps its consumer and its place, and runs no job
+     * it already ran.
+     */
+    #[Test]
+    public function a_queue_whose_mapped_name_holds_another_queues_subject_reads_through_its_own(): void
+    {
+        $dotted = $this->queue . '.jobs';
+        $dashed = $this->queue . '-jobs';
+        $this->consumers = [NatsTransport::consumerName($dotted), NatsTransport::ownConsumerName($dashed), NatsTransport::ownConsumerName($dotted)];
+        $seen = ['dotted' => [], 'dashed' => []];
+        $failure = null;
+
+        Coroutine\run(function () use ($dotted, $dashed, &$seen, &$failure): void {
+            try {
+                $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $transport = $this->transport();
+                $transport->publish($dotted, 'dotted-1');
+                // Published while the mapped name read the other queue: never read by anyone.
+                $transport->publish($dashed, 'dashed-0');
+                // The release before: the mapped name made for the dotted queue, dotted-1 run and acked.
+                $client->ensurePullConsumer('QUEUE', NatsTransport::consumerName($dotted), 'semitexa.queue.' . $dotted);
+                $deadline = microtime(true) + 5.0;
+                do {
+                    $first = $client->pullMessages('QUEUE', NatsTransport::consumerName($dotted), 1);
+                } while ($first === [] && microtime(true) < $deadline);
+                self::assertSame(['dotted-1'], array_map(static fn ($m): string => $m->body, $first));
+                $first[0]->ack();
+                $transport->publish($dotted, 'dotted-2');
+                $transport->publish($dashed, 'dashed-1');
+
+                $deadline = microtime(true) + 5.0;
+                while ((count($seen['dotted']) < 1 || count($seen['dashed']) < 2) && microtime(true) < $deadline) {
+                    $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                        $seen['dashed'][] = $payload;
+                    });
+                    $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                        $seen['dotted'][] = $payload;
+                    });
+                }
+                // One more pull each: nothing already run comes again.
+                $transport->consumeBatch($dotted, static function (string $payload) use (&$seen): void {
+                    $seen['dotted'][] = $payload;
+                });
+                $transport->consumeBatch($dashed, static function (string $payload) use (&$seen): void {
+                    $seen['dashed'][] = $payload;
+                });
+                $seen['own'] = $client->consumerState('QUEUE', NatsTransport::ownConsumerName($dashed))['filterSubject'] ?? null;
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['dotted' => ['dotted-2'], 'dashed' => ['dashed-0', 'dashed-1'], 'own' => 'semitexa.queue.' . $dashed], $seen);
+    }
+
+    /**
+     * Two queues' workers that create the mapped name at once: the second
+     * create must leave the first one's consumer as it is. The legacy create
+     * pointed it at the second queue's subject and answered ok, and both
+     * queues ended on one consumer again (review, reproduced on NATS 2.12).
+     */
+    #[Test]
+    public function a_create_that_meets_a_consumer_of_another_subject_leaves_it_as_it_was(): void
+    {
+        $name = NatsTransport::consumerName($this->queue . '.race');
+        $this->consumers = [$name];
+        $result = null;
+        $failure = null;
+
+        Coroutine\run(function () use ($name, &$result, &$failure): void {
+            try {
+                $client = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $client->ensureStream('QUEUE', ['subjects' => ['semitexa.queue.>']]);
+                // The other worker looked first and saw no consumer (its library remembers that).
+                $otherWorker = new NatsClient(new ClusterConfig(id: 'admin', url: $this->natsUrl));
+                $otherWorker->deleteConsumer('QUEUE', $name);
+                $first = $client->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '.race', 300.0, 5);
+                $again = $client->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '.race', 300.0, 5);
+                $other = $otherWorker->createPullConsumerIfAbsent('QUEUE', $name, 'semitexa.queue.' . $this->queue . '-race', 300.0, 5);
+                $result = [$first, $again, $other, $client->consumerState('QUEUE', $name)['filterSubject'] ?? null];
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame([true, true, false, 'semitexa.queue.' . $this->queue . '.race'], $result);
     }
 
     #[Test]
@@ -160,6 +307,43 @@ final class NatsQueueTransportTest extends TestCase
     }
 
     #[Test]
+    public function a_delayed_job_is_handled_once_it_is_due_and_does_not_hold_up_the_rest(): void
+    {
+        // The worker used to sleep a retry's delay inside the consume loop.
+        $seen = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$seen, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $published = microtime(true);
+                $transport->publishDelayed($this->queue, 'retry', 3);
+                $transport->publish($this->queue, 'fresh');
+
+                $deadline = microtime(true) + 10.0;
+                while (count($seen) < 2 && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$seen, $published): void {
+                        $seen[] = [$payload, microtime(true) - $published];
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['fresh', 'retry'], array_column($seen, 0));
+        // A pull waits up to ~1.5 s for its batch; the fresh job is handled by
+        // the first one, long before the delayed job is due.
+        self::assertLessThan(2.5, $seen[0][1], 'the fresh job waited for the delayed one');
+        self::assertGreaterThanOrEqual(2.75, $seen[1][1], 'the delayed job was handled before it was due');
+        self::assertSame(0, $this->pendingAcks());
+    }
+
+    #[Test]
     public function a_job_with_an_empty_body_reaches_the_handler_and_is_acked(): void
     {
         $seen = null;
@@ -246,6 +430,172 @@ final class NatsQueueTransportTest extends TestCase
         });
 
         return (int) $pending;
+    }
+
+    /**
+     * ep-queue-monitoring: QueueWorker dead-letters to `<queue>.failed`, which
+     * nothing consumes. The inspector lists those messages (newest first, the
+     * stream sequence as id), queues one again with attempts reset, and
+     * forgets one that was never readable.
+     */
+    #[Test]
+    public function dead_letters_are_listed_retried_into_the_queue_and_forgotten(): void
+    {
+        $result = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$result, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue . '.failed', (string) json_encode([
+                    'type' => 'handler', 'handler' => 'App\\Jobs\\SendInvoice', 'attempts' => 3, 'error' => 'SMTP down', 'failed_at' => '2026-10-21T00:00:00+00:00',
+                ]));
+                $transport->publish($this->queue . '.failed', '{"raw":"x","error":"not a JSON object"}');
+
+                $result['listed'] = $transport->deadLetters($this->queue);
+                $readable = $result['listed'][1];
+                $result['retried'] = $transport->retryDeadLetter($this->queue, $readable->id);
+                $result['retriedTwice'] = $transport->retryDeadLetter($this->queue, $readable->id);
+                $result['forgot'] = $transport->forgetDeadLetter($this->queue, $result['listed'][0]->id);
+                $result['left'] = $transport->deadLetters($this->queue);
+                $result['notOurs'] = $transport->forgetDeadLetter('another-' . $this->queue, $readable->id);
+
+                // Drain for a while: a second copy of the retried job would arrive too.
+                $result['requeued'] = [];
+                $deadline = microtime(true) + 3.0;
+                while (microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use (&$result): void {
+                        $result['requeued'][] = json_decode($payload, true);
+                    });
+                }
+
+                // Letters on both sides of many other messages: the listing
+                // widens its window back from the newest until it holds them.
+                for ($i = 0; $i < 3; $i++) {
+                    $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => "Old{$i}", 'error' => 'e']));
+                }
+                for ($i = 0; $i < 300; $i++) {
+                    $transport->publish($this->queue . '.noise', 'x');
+                }
+                $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => 'Newest', 'error' => 'e']));
+                $result['window'] = array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue, 10));
+                $result['newestOnly'] = array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue, 1));
+                $result['depth'] = $transport->depth($this->queue);
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertCount(2, $result['listed']);
+        self::assertFalse($result['listed'][0]->retryable, 'newest first: the unreadable one was published last');
+        self::assertSame('App\\Jobs\\SendInvoice', $result['listed'][1]->target);
+        self::assertSame('SMTP down', $result['listed'][1]->error);
+        self::assertTrue($result['retried']);
+        self::assertFalse($result['retriedTwice'], 'retried once, then gone');
+        self::assertTrue($result['forgot']);
+        self::assertSame([], $result['left']);
+        self::assertFalse($result['notOurs'], 'a dead letter of another queue is not touched');
+        self::assertCount(1, $result['requeued'], 'the retried job arrives once');
+        self::assertSame(0, $result['requeued'][0]['attempts'] ?? null, 'attempts start over');
+        self::assertSame(['Newest', 'Old2', 'Old1', 'Old0'], $result['window']);
+        self::assertSame(['Newest'], $result['newestOnly']);
+        self::assertArrayNotHasKey('error', $result['requeued'][0]);
+        self::assertSame(0, $result['depth']);
+    }
+
+    /**
+     * Stopped (SIGTERM) on the first message of a batch: the rest of the batch
+     * must not run here, past the stop, nor wait out ACK_WAIT (300 s) — they
+     * go back to the stream at once, for the next worker.
+     */
+    #[Test]
+    public function a_stop_mid_batch_hands_the_rest_back_at_once(): void
+    {
+        $ran = ['stopped' => [], 'next' => []];
+        $failure = null;
+
+        Coroutine\run(function () use (&$ran, &$failure): void {
+            try {
+                $transport = $this->transport();
+                foreach (['a', 'b', 'c'] as $payload) {
+                    $transport->publish($this->queue, $payload);
+                }
+                $deadline = microtime(true) + 5.0;
+                while ($ran['stopped'] === [] && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use ($transport, &$ran): void {
+                        $ran['stopped'][] = $payload;
+                        $transport->stop();
+                    });
+                }
+
+                $next = $this->transport();
+                $deadline = microtime(true) + 5.0;
+                while (count($ran['stopped']) + count($ran['next']) < 3 && microtime(true) < $deadline) {
+                    $next->consumeBatch($this->queue, static function (string $payload) use (&$ran): void {
+                        $ran['next'][] = $payload;
+                    });
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+        self::assertCount(1, $ran['stopped'], 'nothing ran after the stop');
+        $all = [...$ran['stopped'], ...$ran['next']];
+        sort($all);
+        self::assertSame(['a', 'b', 'c'], $all, 'the rest reached the next worker within seconds, each once');
+    }
+
+    /**
+     * A stop handed the rest of the batch back with a nak, which spends a
+     * delivery: one already on its last delivery was dropped, without a word.
+     * It runs before the worker stops instead.
+     */
+    #[Test]
+    public function a_stop_does_not_hand_back_a_message_on_its_last_delivery(): void
+    {
+        $attempts = [];
+        $finished = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$attempts, &$finished, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue, 'x');
+                $transport->publish($this->queue, 'y');
+                $deadline = microtime(true) + 20.0;
+                while (count($finished) < 2 && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use ($transport, &$attempts, &$finished): void {
+                        $attempts[$payload] = ($attempts[$payload] ?? 0) + 1;
+                        if ($attempts[$payload] < 5) {
+                            throw new \RuntimeException('not yet');
+                        }
+                        $finished[] = $payload;
+                        if ($payload === 'x') {
+                            $transport->stop();
+                        }
+                    });
+                    if (in_array('x', $finished, true)) {
+                        break;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+        sort($finished);
+        self::assertSame(['x', 'y'], $finished, 'y, on its fifth delivery, ran in the batch the stop came in');
     }
 
     private function transport(): NatsTransport

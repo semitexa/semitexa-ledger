@@ -14,6 +14,9 @@ namespace Semitexa\Ledger\Application\Service\Nats;
  */
 final class PulledMessage
 {
+    /** Set by a delayed publish: the unix ms the message is due. */
+    public const NOT_BEFORE_HEADER = 'Semitexa-Not-Before';
+
     /**
      * @param \Closure(): void       $ack
      * @param \Closure(float): void  $nak
@@ -26,6 +29,8 @@ final class PulledMessage
         private readonly \Closure $nak,
         /** Which delivery of this message this is (1 = first); 0 when unknown. */
         public readonly int $deliveryCount = 0,
+        /** Unix ms before which the message is not to be handled; 0 = now. */
+        public readonly int $notBeforeMs = 0,
     ) {}
 
     public function ack(): void
