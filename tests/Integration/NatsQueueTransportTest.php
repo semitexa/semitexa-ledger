@@ -553,6 +553,51 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(['a', 'b', 'c'], $all, 'the rest reached the next worker within seconds, each once');
     }
 
+    /**
+     * A stop handed the rest of the batch back with a nak, which spends a
+     * delivery: one already on its last delivery was dropped, without a word.
+     * It runs before the worker stops instead.
+     */
+    #[Test]
+    public function a_stop_does_not_hand_back_a_message_on_its_last_delivery(): void
+    {
+        $attempts = [];
+        $finished = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$attempts, &$finished, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue, 'x');
+                $transport->publish($this->queue, 'y');
+                $deadline = microtime(true) + 20.0;
+                while (count($finished) < 2 && microtime(true) < $deadline) {
+                    $transport->consumeBatch($this->queue, static function (string $payload) use ($transport, &$attempts, &$finished): void {
+                        $attempts[$payload] = ($attempts[$payload] ?? 0) + 1;
+                        if ($attempts[$payload] < 5) {
+                            throw new \RuntimeException('not yet');
+                        }
+                        $finished[] = $payload;
+                        if ($payload === 'x') {
+                            $transport->stop();
+                        }
+                    });
+                    if (in_array('x', $finished, true)) {
+                        break;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+        sort($finished);
+        self::assertSame(['x', 'y'], $finished, 'y, on its fifth delivery, ran in the batch the stop came in');
+    }
+
     private function transport(): NatsTransport
     {
         $clusters = new ClusterRegistry();

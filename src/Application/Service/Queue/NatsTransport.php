@@ -153,11 +153,15 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         }
 
         foreach ($messages as $msg) {
-            if (!$this->running) {
-                // Stopped (SIGTERM) in the middle of a batch: the rest are
-                // already delivered to this worker. Back to the stream at
-                // once, for another replica or the next start, rather than
-                // run here past the stop or left for ACK_WAIT.
+            // Stopped (SIGTERM) in the middle of a batch: the rest are
+            // already delivered to this worker. Back to the stream at once,
+            // for another replica or the next start, rather than run here
+            // past the stop or left for ACK_WAIT — except one on its last
+            // delivery: every nak spends one, and that nak was the end of it,
+            // with nothing logged. That one runs before the worker stops (at
+            // most a batch of them; past WORKER_STOP_GRACE_PERIOD the kill
+            // ends it as before).
+            if (!$this->running && $msg->deliveryCount < self::MAX_DELIVER) {
                 $msg->nak(0.0);
                 continue;
             }
@@ -185,7 +189,13 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
                     'trace'    => $e->getTraceAsString(),
                 ];
                 if ($msg->deliveryCount >= self::MAX_DELIVER) {
-                    // JetStream will not deliver it again: the job is gone.
+                    // JetStream will not deliver it again. The stream still
+                    // holds it (for NATS_QUEUE_MAX_AGE_DAYS): this says where,
+                    // `nats stream get QUEUE <seq>`. Not the body itself, which
+                    // can carry what a log must not (a reset link, an address).
+                    $context['stream_sequence'] = $msg->streamSequence;
+                    $context['body_sha1'] = sha1($msg->body);
+                    $context['body_bytes'] = strlen($msg->body);
                     StaticLoggerBridge::error('queue', sprintf('NATS queue job dropped after %d attempts', self::MAX_DELIVER), $context);
                 } else {
                     StaticLoggerBridge::error('queue', 'NATS queue job failed, will be redelivered', $context);
