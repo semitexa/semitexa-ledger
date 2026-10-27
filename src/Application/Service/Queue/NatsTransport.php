@@ -33,7 +33,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     private const DUE_TOLERANCE_MS = 250;
     private const RETRY_DELAY = 5.0;
 
-    /** Dead letters looked at per listing, at most: each is one request to the server. */
+    /** Messages a walk reads, at most: each is one request to the server. */
     private const WALK_LIMIT = 10_000;
 
     private bool $streamReady = false;
@@ -47,6 +47,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     public function __construct(
         private readonly ClusterRegistry $clusters,
         private readonly float $retryDelaySeconds = self::RETRY_DELAY,
+        private readonly int $walkLimit = self::WALK_LIMIT,
     ) {}
 
     public function publish(string $queueName, string $payload): void
@@ -199,8 +200,9 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
                     // holds it (for NATS_QUEUE_MAX_AGE_DAYS): this says where,
                     // `nats stream get QUEUE <seq>`. Not the body itself, which
                     // can carry what a log must not (a reset link, an address).
+                    // Nor a plain hash of it: a predictable body (an address)
+                    // is found again by hashing guesses.
                     $context['stream_sequence'] = $msg->streamSequence;
-                    $context['body_sha1'] = sha1($msg->body);
                     $context['body_bytes'] = strlen($msg->body);
                     StaticLoggerBridge::error('queue', sprintf('NATS queue job dropped after %d attempts', self::MAX_DELIVER), $context);
                 } else {
@@ -351,18 +353,31 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         // sequence 1 cost every letter ever and, past its cap, hid the newest.
         // A letter's tombstone is published after it, so the window's
         // tombstones are found from the same start.
+        //
+        // A walk stops at its cap from the OLDEST end: a wider window that
+        // holds more letters than that lost the newest ones, and one with more
+        // tombstones listed handled letters as unhandled. Such a window is not
+        // used and the widening stops: the narrower one before it stands (the
+        // first one is used either way, being all there is).
         $span = 256;
+        $found = null;
         do {
             $from = max(1, $newest['seq'] - $span);
             $handled = $this->handledSequences($queue, $from);
-            $found = [];
+            $window = [];
+            $walked = 0;
             foreach ($this->walk($subject, $from) as $message) {
-                if (!isset($handled[$message['seq']])) {
-                    $found[] = $message;
+                $walked++;
+                if (!isset($handled['sequences'][$message['seq']])) {
+                    $window[] = $message;
                 }
             }
+            $complete = $handled['complete'] && $walked < $this->walkLimit;
+            if ($complete || $found === null) {
+                $found = $window;
+            }
             $span *= 8;
-        } while (count($found) < $limit && $from > 1);
+        } while ($complete && count($found) < $limit && $from > 1);
         $found = array_slice($found, -$limit);
 
         return array_map(static function (array $message) use ($queue): \Semitexa\Core\Queue\DeadLetter {
@@ -431,21 +446,28 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         }
     }
 
-    /** @return array<int, true> dead-letter sequences at or after $from already retried or forgotten */
+    /**
+     * Dead-letter sequences at or after $from already retried or forgotten;
+     * not complete when the walk stopped at its cap.
+     *
+     * @return array{sequences: array<int, true>, complete: bool}
+     */
     private function handledSequences(string $queue, int $from = 1): array
     {
         $handled = [];
+        $walked = 0;
         foreach ($this->walk(self::SUBJECT_PREFIX . $queue . '.failed.handled', $from) as $message) {
+            $walked++;
             if (ctype_digit($message['data'])) {
                 $handled[(int) $message['data']] = true;
             }
         }
 
-        return $handled;
+        return ['sequences' => $handled, 'complete' => $walked < $this->walkLimit];
     }
 
     /**
-     * Every stored message of one subject, oldest first, at most WALK_LIMIT.
+     * Every stored message of one subject, oldest first, at most the walk limit.
      *
      * @return \Generator<array{seq: int, subject: string, data: string, time: string}>
      */
@@ -453,7 +475,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     {
         $client = $this->primaryClient();
         $seq = max(1, $from);
-        for ($i = 0; $i < self::WALK_LIMIT; $i++) {
+        for ($i = 0; $i < $this->walkLimit; $i++) {
             $message = $client->streamMessage(self::STREAM_NAME, $seq, $subject);
             if ($message === null) {
                 return;
@@ -474,8 +496,18 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
             return null;
         }
 
-        // Its tombstone, if any, came after it: only those are read.
-        return isset($this->handledSequences($queue, $message['seq'])[$message['seq']]) ? null : $message;
+        // Its tombstone, if any, came after it: only those are read. Past the
+        // walk's cap it may be one not read, and a retry would run the job
+        // again: refused rather than guessed.
+        $handled = $this->handledSequences($queue, $message['seq']);
+        if (isset($handled['sequences'][$message['seq']])) {
+            return null;
+        }
+        if (!$handled['complete']) {
+            throw new \RuntimeException("Dead letter {$id}: {$this->walkLimit} or more retries and forgets came after it, so whether it was handled is not known; it is left as it is.");
+        }
+
+        return $message;
     }
 
     /** @return array{pending: int, deliveredSeq: int}|null the backlog of the consumer that reads this queue */

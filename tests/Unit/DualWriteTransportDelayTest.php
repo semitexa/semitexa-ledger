@@ -71,6 +71,7 @@ final class DualWriteTransportDelayTest extends TestCase
     {
         $nats = self::delaying();
         $database = self::delaying();
+        $saved = self::registryState();
         QueueTransportRegistry::reset();
         try {
             QueueTransportRegistry::register('test-nats', self::factory($nats));
@@ -88,7 +89,50 @@ final class DualWriteTransportDelayTest extends TestCase
             $this->expectException(\InvalidArgumentException::class);
             (new DualWriteTransportFactory('dual', 'test-db'))->create();
         } finally {
-            QueueTransportRegistry::reset();
+            self::restoreRegistry($saved);
+        }
+    }
+
+    /** database and db are one table: two writers into it queued every job twice. */
+    #[Test]
+    public function the_two_names_of_the_database_transport_are_one_transport(): void
+    {
+        $saved = self::registryState();
+        QueueTransportRegistry::reset();
+        try {
+            QueueTransportRegistry::register('database', self::factory(self::delaying()));
+            QueueTransportRegistry::register('db', self::factory(self::delaying()));
+            $primary = QueueTransportRegistry::create('database');
+
+            self::assertSame($primary, (new DualWriteTransportFactory('database', 'db'))->create());
+            self::assertSame(QueueTransportRegistry::create('db'), (new DualWriteTransportFactory('DB', 'Database'))->create());
+        } finally {
+            self::restoreRegistry($saved);
+        }
+    }
+
+    /**
+     * reset() empties the registry for the whole process: a later test that
+     * creates a transport registered at boot (dual, nats) found none.
+     *
+     * @return array<string, mixed>
+     */
+    private static function registryState(): array
+    {
+        $state = [];
+        foreach ((new \ReflectionClass(QueueTransportRegistry::class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $state[$property->getName()] = $property->getValue();
+        }
+
+        return $state;
+    }
+
+    /** @param array<string, mixed> $state */
+    private static function restoreRegistry(array $state): void
+    {
+        $class = new \ReflectionClass(QueueTransportRegistry::class);
+        foreach ($state as $name => $value) {
+            $class->getProperty($name)->setValue(null, $value);
         }
     }
 

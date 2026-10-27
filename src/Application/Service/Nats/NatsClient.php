@@ -130,15 +130,22 @@ final class NatsClient
     }
 
     /**
+     * $answers are JetStream error codes that are an answer, not a failure
+     * ("no such consumer"): null for them, and the socket is kept.
+     *
      * @template T
      * @param callable(): T $operation
-     * @return T
+     * @param list<int> $answers
+     * @return ($answers is array{} ? T : T|null)
      */
-    private function reconnectingOnFailure(callable $operation): mixed
+    private function reconnectingOnFailure(callable $operation, array $answers = []): mixed
     {
         try {
             return $operation();
         } catch (\Throwable $e) {
+            if (in_array($e->getCode(), $answers, true)) {
+                return null;
+            }
             $this->reconnect();
             throw $e;
         }
@@ -517,14 +524,9 @@ final class NatsClient
         // Asked of the server, not the library's Consumer::exists(): that one
         // answers from what this client saw, and another worker may have
         // deleted the consumer since.
-        try {
-            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
-        } catch (\Throwable $e) {
-            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
-                return null;
-            }
-            throw $e;
-        }
+        // A worker that only inspects (depth, dead letters) never publishes
+        // or pulls: this is all that can replace a socket NATS left dead.
+        $info = $this->reconnectingOnFailure(fn (): ?object => $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}"), [self::CONSUMER_NOT_FOUND]);
         if (!$info instanceof Payload) {
             return null;
         }
@@ -603,14 +605,7 @@ final class NatsClient
         if ($nextBySubject !== null && $lastBySubject === null) {
             $args['next_by_subj'] = $nextBySubject;
         }
-        try {
-            $reply = $this->client()->api("STREAM.MSG.GET.{$streamName}", $args);
-        } catch (\Throwable $e) {
-            if (in_array($e->getCode(), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND], true)) {
-                return null;
-            }
-            throw $e;
-        }
+        $reply = $this->reconnectingOnFailure(fn (): ?object => $this->client()->api("STREAM.MSG.GET.{$streamName}", $args), [self::NO_MESSAGE_FOUND, self::STREAM_NOT_FOUND]);
         if (!$reply instanceof Payload) {
             return null;
         }
@@ -640,14 +635,7 @@ final class NatsClient
      */
     public function consumerBacklog(string $streamName, string $consumerName): ?array
     {
-        try {
-            $info = $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}");
-        } catch (\Throwable $e) {
-            if ($e->getCode() === self::CONSUMER_NOT_FOUND) {
-                return null;
-            }
-            throw $e;
-        }
+        $info = $this->reconnectingOnFailure(fn (): ?object => $this->client()->api("CONSUMER.INFO.{$streamName}.{$consumerName}"), [self::CONSUMER_NOT_FOUND]);
         if (!$info instanceof Payload || $info->getValue('error.err_code') !== null) {
             return null;
         }

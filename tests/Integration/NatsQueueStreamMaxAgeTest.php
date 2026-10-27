@@ -108,9 +108,15 @@ final class NatsQueueStreamMaxAgeTest extends TestCase
             $client->ensureStream(self::STREAM, ['subjects' => ['maxage.probe.>'], 'duplicate_window' => 120]);
 
             // The server will not keep messages for less than the window it
-            // checks duplicates in.
-            $this->expectException(\Throwable::class);
-            StreamMaxAge::ensure($client, self::STREAM, 60_000_000_000);
+            // checks duplicates in (JSStreamMaxAgeDuplicateWindowErr).
+            try {
+                StreamMaxAge::ensure($client, self::STREAM, 60_000_000_000);
+                $refusal = null;
+            } catch (\Exception $e) {
+                $refusal = [$e->getCode(), $e->getMessage()];
+            }
+            self::assertSame([10052, 'duplicates window can not be larger then max age'], $refusal);
+            self::assertSame(0, (int) $stream->info()->config->max_age, 'a refused update changes nothing');
         } finally {
             if ($stream->exists()) {
                 $stream->delete();

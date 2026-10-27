@@ -34,8 +34,12 @@ final class DelayedDualWriteTransport implements DelayedQueueTransportInterface,
                 ? $this->secondary->publishDelayed($queueName, $payload, $delaySeconds)
                 : $this->secondary->publish($queueName, $payload);
         } catch (\Throwable $e) {
+            // Nothing publishes it to the secondary again: after the switch
+            // this job (a delayed retry, say) is not there. The warning is the
+            // only trace of it, so it says which delay went missing.
             StaticLoggerBridge::warning('queue', 'DualWriteTransport secondary publish failed', [
                 'queue' => $queueName,
+                'delay_seconds' => $delaySeconds,
                 'error' => $e->getMessage(),
             ]);
         }

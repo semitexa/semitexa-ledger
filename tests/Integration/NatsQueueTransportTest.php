@@ -454,11 +454,15 @@ final class NatsQueueTransportTest extends TestCase
 
                 $result['listed'] = $transport->deadLetters($this->queue);
                 $readable = $result['listed'][1];
+                // The consumer exists before the retry, so the depth read
+                // below counts it, not a queue no consumer reads yet.
+                $transport->consumeBatch($this->queue, static function (): void {});
                 $result['retried'] = $transport->retryDeadLetter($this->queue, $readable->id);
                 $result['retriedTwice'] = $transport->retryDeadLetter($this->queue, $readable->id);
                 $result['forgot'] = $transport->forgetDeadLetter($this->queue, $result['listed'][0]->id);
                 $result['left'] = $transport->deadLetters($this->queue);
                 $result['notOurs'] = $transport->forgetDeadLetter('another-' . $this->queue, $readable->id);
+                $result['depthBefore'] = $transport->depth($this->queue);
 
                 // Drain for a while: a second copy of the retried job would arrive too.
                 $result['requeued'] = [];
@@ -503,7 +507,107 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(0, $result['requeued'][0]['attempts'] ?? null, 'attempts start over');
         self::assertSame(['Newest', 'Old2', 'Old1', 'Old0'], $result['window']);
         self::assertSame(['Newest'], $result['newestOnly']);
+        self::assertSame(1, $result['depthBefore'], 'the retried job waits in the backlog');
         self::assertArrayNotHasKey('error', $result['requeued'][0]);
+        self::assertSame(0, $result['depth']);
+    }
+
+    /**
+     * A walk stops at its cap from the oldest end. A wider window holding
+     * more letters than that replaced the narrower one and lost the newest
+     * letter; one with more tombstones after a letter than that missed its
+     * tombstone, and a retry ran the job a second time.
+     */
+    #[Test]
+    public function a_walk_cut_short_by_its_cap_neither_hides_the_newest_letter_nor_retries_a_handled_one(): void
+    {
+        $result = [];
+        $failure = null;
+        $old4 = '';
+
+        Coroutine\run(function () use (&$result, &$failure, &$old4): void {
+            try {
+                $capped = $this->transport(walkLimit: 4);
+                $full = $this->transport();
+                for ($i = 0; $i < 5; $i++) {
+                    $full->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => "Old{$i}", 'error' => 'e']));
+                }
+                for ($i = 0; $i < 300; $i++) {
+                    $full->publish($this->queue . '.noise', 'x');
+                }
+                $full->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => 'Newest', 'error' => 'e']));
+
+                $result['listed'] = array_map(static fn ($l): string => $l->target, $capped->deadLetters($this->queue, 10));
+
+                $ids = [];
+                foreach ($full->deadLetters($this->queue, 10) as $letter) {
+                    $ids[$letter->target] = $letter->id;
+                }
+                // Four tombstones after Old4, none of them its own; then its own.
+                foreach (['Old0', 'Old1', 'Old2', 'Old3', 'Old4'] as $target) {
+                    $full->forgetDeadLetter($this->queue, $ids[$target]);
+                }
+                $old4 = $ids['Old4'];
+                try {
+                    $capped->retryDeadLetter($this->queue, $ids['Old4']);
+                    $result['retry'] = 'retried';
+                } catch (\RuntimeException $e) {
+                    $result['retry'] = $e->getMessage();
+                }
+                $result['forgetOld0'] = $capped->forgetDeadLetter($this->queue, $ids['Old0']);
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['Newest'], $result['listed'], 'the narrow window stands; the wider one held more than a walk reads');
+        self::assertSame("Dead letter {$old4}: 4 or more retries and forgets came after it, so whether it was handled is not known; it is left as it is.", $result['retry']);
+        self::assertFalse($result['forgetOld0'], 'a tombstone the walk did read still counts');
+    }
+
+    /**
+     * A worker that only inspects (queue:failed, depth) never publishes or
+     * pulls: after a NATS restart its dead socket failed every inspection
+     * until the process restarted. The call that fails drops the socket, so
+     * the next one runs on a new connection.
+     */
+    #[Test]
+    public function an_inspection_after_the_connection_died_works_the_next_time(): void
+    {
+        $result = [];
+        $failure = null;
+
+        Coroutine\run(function () use (&$result, &$failure): void {
+            try {
+                $transport = $this->transport();
+                $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => 'Dead', 'error' => 'e']));
+                $inspections = [
+                    'letters' => fn (): array => array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue)),
+                    'depth' => fn (): int => $transport->depth($this->queue),
+                ];
+                foreach ($inspections as $name => $inspect) {
+                    $this->killSocket($transport);
+                    try {
+                        $inspect();
+                    } catch (\Throwable) {
+                        // The call that meets the dead socket may fail.
+                    }
+                    $result[$name] = $inspect();
+                }
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(['Dead'], $result['letters']);
         self::assertSame(0, $result['depth']);
     }
 
@@ -598,12 +702,14 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(['x', 'y'], $finished, 'y, on its fifth delivery, ran in the batch the stop came in');
     }
 
-    private function transport(): NatsTransport
+    private function transport(?int $walkLimit = null): NatsTransport
     {
         $clusters = new ClusterRegistry();
         $clusters->add(new ClusterConfig(id: 'primary', url: $this->natsUrl));
         $clusters->connect();
 
-        return new NatsTransport($clusters, retryDelaySeconds: 0.5);
+        return $walkLimit === null
+            ? new NatsTransport($clusters, retryDelaySeconds: 0.5)
+            : new NatsTransport($clusters, retryDelaySeconds: 0.5, walkLimit: $walkLimit);
     }
 }

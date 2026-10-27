@@ -16,6 +16,13 @@ use Semitexa\Core\Queue\QueueTransportRegistry;
  */
 final class DualWriteTransportFactory implements QueueTransportFactoryInterface
 {
+    /**
+     * A name core registers a second time for one transport. The registry
+     * makes an instance per name, so database and db were two writers into the
+     * same queue_messages table: every job queued twice and run twice.
+     */
+    private const ALIASES = ['db' => 'database'];
+
     public function __construct(
         private readonly string $primaryName,
         private readonly string $secondaryName,
@@ -24,8 +31,8 @@ final class DualWriteTransportFactory implements QueueTransportFactoryInterface
     public function create(): QueueTransportInterface
     {
         // 'dual' on either side called itself until the stack ran out.
-        $primaryKey = strtolower($this->primaryName);
-        $secondaryKey = strtolower($this->secondaryName);
+        $primaryKey = self::key($this->primaryName);
+        $secondaryKey = self::key($this->secondaryName);
         if ($primaryKey === 'dual') {
             throw new \InvalidArgumentException("EVENTS_DUAL_PRIMARY cannot be 'dual'.");
         }
@@ -47,5 +54,12 @@ final class DualWriteTransportFactory implements QueueTransportFactoryInterface
         }
 
         return DualWriteTransport::of($primary, $secondary);
+    }
+
+    private static function key(string $name): string
+    {
+        $key = strtolower($name);
+
+        return self::ALIASES[$key] ?? $key;
     }
 }
