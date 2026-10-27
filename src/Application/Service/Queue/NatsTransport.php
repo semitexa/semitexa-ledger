@@ -388,7 +388,14 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         }
         $retry = \Semitexa\Core\Queue\DeadLetter::fromStored($id, $queue, $message['data'])->retryPayload();
         $this->publishOnce(self::SUBJECT_PREFIX . $queue, $retry, "dlq-retry-{$message['seq']}");
-        $this->markHandled($queue, $message['seq']);
+        // Queued, but still listed: the operator saw the raw error, took the
+        // retry for failed, and ran it again; past JetStream's duplicate
+        // window that queued the job a second time.
+        try {
+            $this->markHandled($queue, $message['seq']);
+        } catch (\Throwable $e) {
+            throw new \RuntimeException("Dead letter {$id} was queued again, but could not be marked handled ({$e->getMessage()}): it is still listed. Retrying it within two minutes queues it once; later it runs twice, so forget it instead (queue:retry --forget).", 0, $e);
+        }
 
         return true;
     }
