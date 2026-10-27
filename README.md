@@ -30,6 +30,8 @@ EVENTS_DUAL_PRIMARY=nats
 EVENTS_DUAL_SECONDARY=<other-transport>
 ```
 
+`EVENTS_TRANSPORT=dual` publishes to both transports and consumes from the primary. It holds a retry back when the primary can (NATS, database); a secondary that cannot gets the message at once.
+
 ## Propagate Events
 
 Mark an event with `#[Propagated]` to persist it in the local ledger and publish it to other nodes.
