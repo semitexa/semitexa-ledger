@@ -61,6 +61,12 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
      */
     public function publishDelayed(string $queueName, string $payload, int $delaySeconds): void
     {
+        // The stream deletes a message NATS_QUEUE_MAX_AGE_DAYS after it is
+        // stored, due or not: one held back longer was lost without a trace.
+        $maxAge = self::maxAgeNanoSeconds(Environment::getEnvValue('NATS_QUEUE_MAX_AGE_DAYS'));
+        if ($maxAge > 0 && $delaySeconds * 1_000_000_000 >= $maxAge) {
+            throw new \InvalidArgumentException("A message held back {$delaySeconds} s would be deleted first: the queue stream keeps messages " . intdiv($maxAge, 86_400_000_000_000) . ' days (NATS_QUEUE_MAX_AGE_DAYS).');
+        }
         $this->send($queueName, $payload, [
             PulledMessage::NOT_BEFORE_HEADER => (string) ((int) floor(microtime(true) * 1000) + max(0, $delaySeconds) * 1000),
         ]);

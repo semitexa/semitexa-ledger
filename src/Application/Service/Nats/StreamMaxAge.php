@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Semitexa\Ledger\Application\Service\Nats;
 
+use Semitexa\Core\Log\StaticLoggerBridge;
+
 /**
  * Gives an existing stream a max age. NatsClient::ensureStream() only
  * creates, and a stream made before a retention was set kept every message.
@@ -34,8 +36,30 @@ final class StreamMaxAge
         }
         $config = (array) $current;
         $config['max_age'] = $maxAgeNanoSeconds;
-        $stream->client->api('STREAM.UPDATE.' . $streamName, $config);
+        $before = self::messages($info) ?? 0;
+        $reply = $stream->client->api('STREAM.UPDATE.' . $streamName, $config);
+        // A shorter age deletes everything older at once, and said nothing:
+        // an upgrade that set the 14 days took older dead letters silently.
+        $after = self::messages($reply) ?? $before;
+        StaticLoggerBridge::warning('queue', "NATS stream {$streamName}: max age is now " . ($maxAgeNanoSeconds === 0 ? 'none' : intdiv($maxAgeNanoSeconds, 86_400_000_000_000) . ' days') . '; ' . max(0, $before - $after) . ' older messages were deleted', [
+            'before' => $before,
+            'after' => $after,
+        ]);
 
         return true;
+    }
+
+    /** state.messages of a stream info or update reply, read as the magic getter allows (no isset()). */
+    private static function messages(mixed $reply): ?int
+    {
+        if (!is_object($reply)) {
+            return null;
+        }
+        $state = $reply instanceof \stdClass ? ($reply->state ?? null) : $reply->state;
+        if (is_array($state)) {
+            $state = (object) $state;
+        }
+
+        return is_object($state) && is_numeric($state->messages) ? (int) $state->messages : null;
     }
 }
