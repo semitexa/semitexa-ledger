@@ -168,7 +168,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
             // most a batch of them; past WORKER_STOP_GRACE_PERIOD the kill
             // ends it as before).
             if (!$this->running && $msg->deliveryCount < self::MAX_DELIVER) {
-                $msg->nak(0.0);
+                $this->settle(static fn () => $msg->nak(0.0), 'nak', $queueName);
                 continue;
             }
             $early = $msg->notBeforeMs - (int) floor(microtime(true) * 1000);
@@ -180,7 +180,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
                 // client sends seconds × 10⁹, and a fraction such as 0.267 s
                 // comes out as 267000000.00000003 ns, which the server refuses
                 // and treats as a plain nak — straight back, a delivery spent.
-                $msg->nak((float) (int) ceil($early / 1000));
+                $this->settle(static fn () => $msg->nak((float) (int) ceil($early / 1000)), 'nak', $queueName);
                 continue;
             }
 
@@ -206,14 +206,33 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
                 } else {
                     StaticLoggerBridge::error('queue', 'NATS queue job failed, will be redelivered', $context);
                 }
-                $msg->nak($this->retryDelaySeconds);
+                $delay = $this->retryDelaySeconds;
+                $this->settle(static fn () => $msg->nak($delay), 'nak', $queueName);
                 continue;
             }
 
-            $msg->ack();
+            $this->settle(static fn () => $msg->ack(), 'ack', $queueName);
         }
 
         return count($messages);
+    }
+
+    /**
+     * An ack or nak that fails (the connection dropped) ended the batch and
+     * the worker with it, the rest of the batch unrun. Logged, and the batch
+     * goes on: JetStream delivers the message again after ACK_WAIT, so a job
+     * whose ack was lost can run twice.
+     */
+    private function settle(\Closure $reply, string $kind, string $queueName): void
+    {
+        try {
+            $reply();
+        } catch (\Throwable $e) {
+            StaticLoggerBridge::warning('queue', "NATS queue: the {$kind} failed; the message comes back after its ack wait" . ($kind === 'ack' ? ' and runs again' : ''), [
+                'queue' => $queueName,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
