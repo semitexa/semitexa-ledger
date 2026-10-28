@@ -26,7 +26,7 @@ use Semitexa\Ledger\Application\Service\Replication\ReplicationRelay;
 use Semitexa\Orm\Application\Service\Persistence\ReplicationCapture;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
 use Semitexa\Ledger\Application\Service\OwnershipCache;
-use Semitexa\Ledger\Application\Service\Queue\DualWriteTransport;
+use Semitexa\Ledger\Application\Service\Queue\DualWriteTransportFactory;
 use Semitexa\Ledger\Application\Service\Queue\NatsTransportFactory;
 use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
 
@@ -127,20 +127,7 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         $dualPrimary   = getenv('EVENTS_DUAL_PRIMARY')   ?: null;
         $dualSecondary = getenv('EVENTS_DUAL_SECONDARY')  ?: null;
         if ($dualPrimary !== null && $dualSecondary !== null) {
-            QueueTransportRegistry::register('dual', new class($dualPrimary, $natsFactory) implements \Semitexa\Core\Queue\QueueTransportFactoryInterface {
-                public function __construct(
-                    private readonly string $primaryName,
-                    private readonly NatsTransportFactory $natsFactory,
-                ) {}
-
-                public function create(): \Semitexa\Core\Queue\QueueTransportInterface
-                {
-                    return new DualWriteTransport(
-                        QueueTransportRegistry::create($this->primaryName),
-                        $this->natsFactory->create(),
-                    );
-                }
-            });
+            QueueTransportRegistry::register('dual', new DualWriteTransportFactory($dualPrimary, $dualSecondary));
         }
 
         // Shared services.
