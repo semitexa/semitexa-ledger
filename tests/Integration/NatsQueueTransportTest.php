@@ -585,6 +585,9 @@ final class NatsQueueTransportTest extends TestCase
             try {
                 $transport = $this->transport();
                 $transport->publish($this->queue . '.failed', (string) json_encode(['type' => 'handler', 'handler' => 'Dead', 'error' => 'e']));
+                // Without a consumer depth() is 0 whatever happens; make one, then a job that waits.
+                $transport->consumeBatch($this->queue, static function (): void {});
+                $transport->publish($this->queue, 'waiting');
                 $inspections = [
                     'letters' => fn (): array => array_map(static fn ($l): string => $l->target, $transport->deadLetters($this->queue)),
                     'depth' => fn (): int => $transport->depth($this->queue),
@@ -608,7 +611,7 @@ final class NatsQueueTransportTest extends TestCase
         }
 
         self::assertSame(['Dead'], $result['letters']);
-        self::assertSame(0, $result['depth']);
+        self::assertSame(1, $result['depth'], 'the backlog was read on the new connection, not defaulted');
     }
 
     /**
