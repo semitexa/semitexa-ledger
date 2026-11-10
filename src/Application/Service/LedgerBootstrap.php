@@ -58,6 +58,11 @@ use Semitexa\Orm\Application\Service\Connection\ConnectionRegistry;
  *   LEDGER_STREAM          — JetStream stream name (default: EVENTS)
  *   LEDGER_SUBJECT_PREFIX  — event subject namespace (default: semitexa.events);
  *                            distinct per project sharing one NATS server
+ *   NATS_QUEUE_STREAM      — queue JetStream stream name (default: QUEUE)
+ *   NATS_QUEUE_SUBJECT_PREFIX — queue subject namespace, ending in "."
+ *                            (default: semitexa.queue.); set both, distinct per
+ *                            app sharing one NATS server, or its jobs are read
+ *                            by the other app's workers
  */
 #[AsServerLifecycleListener(
     phase: ServerLifecyclePhase::WorkerStartAfterContainer->value,

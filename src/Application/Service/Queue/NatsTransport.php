@@ -19,11 +19,19 @@ use Semitexa\Ledger\Application\Service\Nats\StreamMaxAge;
  *
  * Messages are published to JetStream (stream must be configured to capture
  * `semitexa.queue.>` subjects). Consumers are created per queue name.
+ *
+ * The stream and the prefix are this app's namespace on the NATS server:
+ * NATS_QUEUE_STREAM (default QUEUE) and NATS_QUEUE_SUBJECT_PREFIX (default
+ * semitexa.queue.). A second app on the same server (an E2E instance next to
+ * the developer's) sets both, or its jobs land in the stream the first one's
+ * workers read and are run against that app's database. They are set
+ * together: a stream captures its own prefix only. The ledger's events have
+ * the same pair, LEDGER_STREAM and LEDGER_SUBJECT_PREFIX.
  */
 final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\Core\Queue\QueueInspectorInterface, \Semitexa\Core\Queue\StoppableQueueTransportInterface
 {
-    private const SUBJECT_PREFIX = 'semitexa.queue.';
-    private const STREAM_NAME    = 'QUEUE';
+    public const DEFAULT_SUBJECT_PREFIX = 'semitexa.queue.';
+    public const DEFAULT_STREAM = 'QUEUE';
     /** Seconds a delivery may stay unacked before JetStream redelivers it — the database transport's lease. */
     private const ACK_WAIT    = 300.0;
     /** Deliveries before a failing message stops being redelivered — the database transport's max_attempts. */
@@ -44,11 +52,51 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     /** @var array<string, string> queue name => the consumer it is read through */
     private array $consumerNames = [];
 
+    private readonly string $stream;
+    private readonly string $subjectPrefix;
+
+    /**
+     * @param string|null $stream        NATS_QUEUE_STREAM when null
+     * @param string|null $subjectPrefix NATS_QUEUE_SUBJECT_PREFIX when null
+     */
     public function __construct(
         private readonly ClusterRegistry $clusters,
         private readonly float $retryDelaySeconds = self::RETRY_DELAY,
         private readonly int $walkLimit = self::WALK_LIMIT,
-    ) {}
+        ?string $stream = null,
+        ?string $subjectPrefix = null,
+    ) {
+        $this->stream = self::streamName($stream ?? Environment::getEnvValue('NATS_QUEUE_STREAM'));
+        $this->subjectPrefix = self::subjectPrefix($subjectPrefix ?? Environment::getEnvValue('NATS_QUEUE_SUBJECT_PREFIX'));
+    }
+
+    /** A JetStream stream name: letters, digits, "_" and "-". Empty is the default. */
+    public static function streamName(?string $value): string
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return self::DEFAULT_STREAM;
+        }
+        if (preg_match('/^[A-Za-z0-9_-]+$/', $value) !== 1) {
+            throw new \InvalidArgumentException("NATS_QUEUE_STREAM '{$value}' is not a stream name: letters, digits, '_' and '-' only.");
+        }
+
+        return $value;
+    }
+
+    /** Dot-separated tokens ending in ".", e.g. "e2e.queue.". Empty is the default. */
+    public static function subjectPrefix(?string $value): string
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return self::DEFAULT_SUBJECT_PREFIX;
+        }
+        if (preg_match('/^(?:[A-Za-z0-9_-]+\.)+$/', $value) !== 1) {
+            throw new \InvalidArgumentException("NATS_QUEUE_SUBJECT_PREFIX '{$value}' is not a subject prefix: dot-separated tokens of letters, digits, '_' and '-', ending in '.' (like semitexa.queue.).");
+        }
+
+        return $value;
+    }
 
     public function publish(string $queueName, string $payload): void
     {
@@ -76,7 +124,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     /** @param array<string, string> $extraHeaders */
     private function send(string $queueName, string $payload, array $extraHeaders): void
     {
-        $subject = self::SUBJECT_PREFIX . $queueName;
+        $subject = $this->subjectPrefix . $queueName;
 
         // One id for both attempts: JetStream drops a second copy with the
         // same Nats-Msg-Id inside its duplicate window, so a retry after a
@@ -132,7 +180,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     public function consumeBatch(string $queueName, callable $callback): int
     {
         $this->ensureQueueStream();
-        $subject      = self::SUBJECT_PREFIX . $queueName;
+        $subject      = $this->subjectPrefix . $queueName;
         $client       = $this->primaryClient();
         $consumerName = $this->consumerFor($client, $queueName, $subject);
 
@@ -151,7 +199,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         }, E_WARNING);
         try {
             $messages = $client->pullMessages(
-                streamName:   self::STREAM_NAME,
+                streamName:   $this->stream,
                 consumerName: $consumerName,
                 batchSize:    10,
             );
@@ -280,9 +328,9 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         }
 
         foreach ([self::consumerName($queueName), self::ownConsumerName($queueName)] as $candidate) {
-            $state = $client->consumerState(self::STREAM_NAME, $candidate);
+            $state = $client->consumerState($this->stream, $candidate);
             if ($state === null) {
-                if (!$client->createPullConsumerIfAbsent(self::STREAM_NAME, $candidate, $subject, self::ACK_WAIT, self::MAX_DELIVER)) {
+                if (!$client->createPullConsumerIfAbsent($this->stream, $candidate, $subject, self::ACK_WAIT, self::MAX_DELIVER)) {
                     continue;
                 }
             } elseif ($state['filterSubject'] !== $subject) {
@@ -290,7 +338,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
             } else {
                 // Ours already: same subject, so this only brings its settings up to date.
                 $client->ensurePullConsumer(
-                    streamName:     self::STREAM_NAME,
+                    streamName:     $this->stream,
                     consumerName:   $candidate,
                     filterSubject:  $subject,
                     ackWaitSeconds: self::ACK_WAIT,
@@ -327,7 +375,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         if ($backlog === null || $backlog['pending'] === 0) {
             return null;
         }
-        $next = $this->primaryClient()->streamMessage(self::STREAM_NAME, $backlog['deliveredSeq'] + 1, self::SUBJECT_PREFIX . $queue);
+        $next = $this->primaryClient()->streamMessage($this->stream, $backlog['deliveredSeq'] + 1, $this->subjectPrefix . $queue);
         $at = $next === null ? false : strtotime($next['time']);
 
         return $at === false ? null : max(0, time() - $at);
@@ -342,8 +390,8 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
      */
     public function deadLetters(string $queue, int $limit = 20): array
     {
-        $subject = self::SUBJECT_PREFIX . $queue . '.failed';
-        $newest = $this->primaryClient()->streamMessage(self::STREAM_NAME, 0, lastBySubject: $subject);
+        $subject = $this->subjectPrefix . $queue . '.failed';
+        $newest = $this->primaryClient()->streamMessage($this->stream, 0, lastBySubject: $subject);
         if ($newest === null) {
             return [];
         }
@@ -402,7 +450,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
             return false;
         }
         $retry = \Semitexa\Core\Queue\DeadLetter::fromStored($id, $queue, $message['data'])->retryPayload();
-        $this->publishOnce(self::SUBJECT_PREFIX . $queue, $retry, "dlq-retry-{$message['seq']}");
+        $this->publishOnce($this->subjectPrefix . $queue, $retry, "dlq-retry-{$message['seq']}");
         // Queued, but still listed: the operator saw the raw error, took the
         // retry for failed, and ran it again; past JetStream's duplicate
         // window that queued the job a second time.
@@ -428,7 +476,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
 
     private function markHandled(string $queue, int $seq): void
     {
-        $this->publishOnce(self::SUBJECT_PREFIX . $queue . '.failed.handled', (string) $seq, "dlq-done-{$seq}");
+        $this->publishOnce($this->subjectPrefix . $queue . '.failed.handled', (string) $seq, "dlq-done-{$seq}");
     }
 
     /** With publish()'s reconnect-and-retry: a stale socket after a NATS restart must not lose a tombstone. */
@@ -456,7 +504,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     {
         $handled = [];
         $walked = 0;
-        foreach ($this->walk(self::SUBJECT_PREFIX . $queue . '.failed.handled', $from) as $message) {
+        foreach ($this->walk($this->subjectPrefix . $queue . '.failed.handled', $from) as $message) {
             $walked++;
             if (ctype_digit($message['data'])) {
                 $handled[(int) $message['data']] = true;
@@ -476,7 +524,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         $client = $this->primaryClient();
         $seq = max(1, $from);
         for ($i = 0; $i < $this->walkLimit; $i++) {
-            $message = $client->streamMessage(self::STREAM_NAME, $seq, $subject);
+            $message = $client->streamMessage($this->stream, $seq, $subject);
             if ($message === null) {
                 return;
             }
@@ -491,8 +539,8 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         if (!ctype_digit($id) || (int) $id < 1) {
             return null;
         }
-        $message = $this->primaryClient()->streamMessage(self::STREAM_NAME, (int) $id);
-        if ($message === null || $message['subject'] !== self::SUBJECT_PREFIX . $queue . '.failed') {
+        $message = $this->primaryClient()->streamMessage($this->stream, (int) $id);
+        if ($message === null || $message['subject'] !== $this->subjectPrefix . $queue . '.failed') {
             return null;
         }
 
@@ -514,11 +562,11 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
     private function backlog(string $queue): ?array
     {
         $client = $this->primaryClient();
-        $subject = self::SUBJECT_PREFIX . $queue;
+        $subject = $this->subjectPrefix . $queue;
         foreach ([self::consumerName($queue), self::ownConsumerName($queue)] as $candidate) {
-            $state = $client->consumerState(self::STREAM_NAME, $candidate);
+            $state = $client->consumerState($this->stream, $candidate);
             if ($state !== null && $state['filterSubject'] === $subject) {
-                return $client->consumerBacklog(self::STREAM_NAME, $candidate);
+                return $client->consumerBacklog($this->stream, $candidate);
             }
         }
 
@@ -561,12 +609,12 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         // <queue>.failed expires the same way, so queue:failed sees that long.
         $maxAge = self::maxAgeNanoSeconds(Environment::getEnvValue('NATS_QUEUE_MAX_AGE_DAYS'));
         $client = $this->primaryClient();
-        $client->ensureStream(self::STREAM_NAME, [
-            'subjects' => [self::SUBJECT_PREFIX . '>'],
+        $client->ensureStream($this->stream, [
+            'subjects' => [$this->subjectPrefix . '>'],
             'max_age' => $maxAge,
         ]);
         try {
-            StreamMaxAge::ensure($client, self::STREAM_NAME, $maxAge);
+            StreamMaxAge::ensure($client, $this->stream, $maxAge);
         } catch (\Throwable $e) {
             // The queue still works on a stream whose age could not be set.
             StaticLoggerBridge::warning('queue', 'NATS QUEUE stream: its max age could not be set; it keeps every message', [
