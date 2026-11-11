@@ -573,7 +573,7 @@ final class NatsTransport implements DelayedQueueTransportInterface, \Semitexa\C
         // No consumer yet: no worker has ever run for this queue, so every
         // message on its subject waits (tk-queue-stats-no-consumer-zero).
         // queue:stats said 0 however many jobs had been published.
-        $pending = $client->subjectMessageCount($this->stream, $subject);
+        $pending = $client->streamMessageCount($this->stream, $subject);
 
         return $pending === 0 ? null : ['pending' => $pending, 'deliveredSeq' => 0];
     }

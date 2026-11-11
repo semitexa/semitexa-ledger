@@ -475,10 +475,21 @@ final class NatsClient
         $this->aliveAt = $now;
     }
 
-    /** How many messages the stream currently holds. */
-    public function streamMessageCount(string $streamName): int
+    /**
+     * How many messages the stream holds; with a subject, on exactly that one:
+     * what waits for a queue no worker has run for yet, so it has no consumer
+     * (tk-queue-stats-no-consumer-zero). The subject is a map key, dots and all.
+     */
+    public function streamMessageCount(string $streamName, ?string $subject = null): int
     {
-        return self::apiInt($this->client()->getApi()->getStream($streamName)->info(), 'state.messages');
+        if ($subject === null) {
+            return self::apiInt($this->client()->getApi()->getStream($streamName)->info(), 'state.messages');
+        }
+        $info = $this->reconnectingOnFailure(fn (): ?object => $this->client()->api("STREAM.INFO.{$streamName}", ['subjects_filter' => $subject]), [self::STREAM_NOT_FOUND]);
+        $subjects = $info instanceof Payload && $info->getValue('error.err_code') === null ? $info->getValue('state.subjects') : null;
+        $count = is_object($subjects) || is_array($subjects) ? (((array) $subjects)[$subject] ?? 0) : 0;
+
+        return is_numeric($count) ? (int) $count : 0;
     }
 
     /** Whether the server runs JetStream (a plain NATS server answers with an error). */
@@ -644,35 +655,6 @@ final class NatsClient
             'pending' => self::apiInt($info, 'num_pending'),
             'deliveredSeq' => self::apiInt($info, 'delivered.stream_seq'),
         ];
-    }
-
-    /**
-     * How many messages the stream holds on exactly this subject: what waits
-     * for a queue whose durable consumer does not exist yet (published before
-     * any worker started). Zero for a stream that does not exist.
-     */
-    public function subjectMessageCount(string $streamName, string $subject): int
-    {
-        $info = $this->reconnectingOnFailure(
-            fn (): ?object => $this->client()->api("STREAM.INFO.{$streamName}", ['subjects_filter' => $subject]),
-            [self::STREAM_NOT_FOUND],
-        );
-        if (!$info instanceof Payload) {
-            return 0;
-        }
-        $error = $info->getValue('error.err_code');
-        if ($error !== null) {
-            if (Row::asInt($error) === self::STREAM_NOT_FOUND) {
-                return 0;
-            }
-            throw new \RuntimeException(sprintf('JetStream refused STREAM.INFO on %s: %s', $streamName, Row::asString($info->getValue('error.description'))), Row::asInt($error));
-        }
-        // The subject is a map key, dots and all: getValue() would read its dots as a path.
-        $subjects = $info->getValue('state.subjects');
-        $subjects = is_object($subjects) ? (array) $subjects : $subjects;
-        $count = is_array($subjects) ? ($subjects[$subject] ?? 0) : 0;
-
-        return is_numeric($count) ? (int) $count : 0;
     }
 
     /** Remove a stream and every message in it. Test and operator cleanup. */
