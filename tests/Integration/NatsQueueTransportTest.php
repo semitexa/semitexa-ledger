@@ -266,6 +266,41 @@ final class NatsQueueTransportTest extends TestCase
         self::assertSame(['after', 'before'], $seen);
     }
 
+    /**
+     * A queue no worker has run for has no consumer yet; what was published to
+     * it still waits, and queue:stats said 0 (tk-queue-stats-no-consumer-zero).
+     */
+    #[Test]
+    public function jobs_published_before_any_worker_ran_are_counted_as_waiting(): void
+    {
+        $depth = null;
+        $age = null;
+        $failure = null;
+
+        Coroutine\run(function () use (&$depth, &$age, &$failure): void {
+            try {
+                $transport = $this->transport();
+                foreach (['a', 'b', 'c'] as $job) {
+                    $transport->publish($this->queue, $job);
+                }
+                // A further queue on the stream is not counted as this one's.
+                $transport->publish($this->queue . 'x', 'other');
+                $this->consumers[] = NatsTransport::consumerName($this->queue . 'x');
+                $depth = $transport->depth($this->queue);
+                $age = $transport->oldestAgeSeconds($this->queue);
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        });
+
+        if ($failure !== null) {
+            throw $failure;
+        }
+
+        self::assertSame(3, $depth, 'every job on the subject waits');
+        self::assertIsInt($age, 'the oldest waiting job has an age');
+    }
+
     #[Test]
     public function the_first_publish_on_a_dead_connection_still_reaches_the_queue(): void
     {

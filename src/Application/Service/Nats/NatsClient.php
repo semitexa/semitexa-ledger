@@ -646,6 +646,35 @@ final class NatsClient
         ];
     }
 
+    /**
+     * How many messages the stream holds on exactly this subject: what waits
+     * for a queue whose durable consumer does not exist yet (published before
+     * any worker started). Zero for a stream that does not exist.
+     */
+    public function subjectMessageCount(string $streamName, string $subject): int
+    {
+        $info = $this->reconnectingOnFailure(
+            fn (): ?object => $this->client()->api("STREAM.INFO.{$streamName}", ['subjects_filter' => $subject]),
+            [self::STREAM_NOT_FOUND],
+        );
+        if (!$info instanceof Payload) {
+            return 0;
+        }
+        $error = $info->getValue('error.err_code');
+        if ($error !== null) {
+            if (Row::asInt($error) === self::STREAM_NOT_FOUND) {
+                return 0;
+            }
+            throw new \RuntimeException(sprintf('JetStream refused STREAM.INFO on %s: %s', $streamName, Row::asString($info->getValue('error.description'))), Row::asInt($error));
+        }
+        // The subject is a map key, dots and all: getValue() would read its dots as a path.
+        $subjects = $info->getValue('state.subjects');
+        $subjects = is_object($subjects) ? (array) $subjects : $subjects;
+        $count = is_array($subjects) ? ($subjects[$subject] ?? 0) : 0;
+
+        return is_numeric($count) ? (int) $count : 0;
+    }
+
     /** Remove a stream and every message in it. Test and operator cleanup. */
     public function deleteStream(string $streamName): void
     {
