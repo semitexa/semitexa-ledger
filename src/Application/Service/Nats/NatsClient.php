@@ -475,10 +475,21 @@ final class NatsClient
         $this->aliveAt = $now;
     }
 
-    /** How many messages the stream currently holds. */
-    public function streamMessageCount(string $streamName): int
+    /**
+     * How many messages the stream holds; with a subject, on exactly that one:
+     * what waits for a queue no worker has run for yet, so it has no consumer
+     * (tk-queue-stats-no-consumer-zero). The subject is a map key, dots and all.
+     */
+    public function streamMessageCount(string $streamName, ?string $subject = null): int
     {
-        return self::apiInt($this->client()->getApi()->getStream($streamName)->info(), 'state.messages');
+        if ($subject === null) {
+            return self::apiInt($this->client()->getApi()->getStream($streamName)->info(), 'state.messages');
+        }
+        $info = $this->reconnectingOnFailure(fn (): ?object => $this->client()->api("STREAM.INFO.{$streamName}", ['subjects_filter' => $subject]), [self::STREAM_NOT_FOUND]);
+        $subjects = $info instanceof Payload && $info->getValue('error.err_code') === null ? $info->getValue('state.subjects') : null;
+        $count = is_object($subjects) || is_array($subjects) ? (((array) $subjects)[$subject] ?? 0) : 0;
+
+        return is_numeric($count) ? (int) $count : 0;
     }
 
     /** Whether the server runs JetStream (a plain NATS server answers with an error). */
