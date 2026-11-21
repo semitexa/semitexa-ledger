@@ -15,8 +15,9 @@ use Semitexa\Ledger\Domain\Model\ClusterConfig;
  * most the configuration timeout (1 s): a frame that arrives ahead of the PONG
  * (the pull's own "408 Request Timeout" sent just after the client stopped
  * reading, a late reply, an INFO) or a PONG a busy broker sends after 1 s made
- * it return false, and a healthy connection was dropped with "did not answer
- * PING" (release preflight, 2026-11-03).
+ * it return false or, on a connection whose last PONG is over 2 s old, throw
+ * "Socket read timeout": a healthy connection was dropped (release preflight,
+ * 2026-11-03).
  *
  * Run against a scripted NATS server in a forked child: it completes the
  * handshake, never delivers, and answers the PING the way each test names.
@@ -82,16 +83,22 @@ final class NatsClientLivenessPingTest extends TestCase
             self::assertSame('NATS connection did not answer PING; reconnecting.', $e->getMessage());
         }
 
-        // 0.6 s of pull, then the PING: 1 s read timeout + 2 s of grace.
+        // 0.6 s of pull, then the PING and 3 s for its PONG.
         self::assertLessThan(4.5, microtime(true) - $start, 'declared dead within the bound');
         self::assertNotSame($connection, $this->innerClientOrNull($client), 'the dead connection is dropped');
     }
 
-    /** A client whose last sign of life is older than LIVENESS_AFTER, so its next empty pull pings. */
+    /** A connected client whose last sign of life is older than LIVENESS_AFTER, so its next empty pull pings. */
     private function clientDueForALivenessCheck(string $script): NatsClient
     {
         $port = $this->startScriptedNatsServer($script);
         $client = new NatsClient(new ClusterConfig(id: 'test', url: "nats://127.0.0.1:{$port}"));
+        // As LedgerBootstrap does for every cluster: a PING/PONG, which dates
+        // the library's last PONG. Once that is older than its pingInterval
+        // (2 s) a read that times out THROWS "Socket read timeout" instead of
+        // returning: the state every long-lived connection is in.
+        $client->connect();
+        usleep(2_100_000);
         (new \ReflectionProperty(NatsClient::class, 'aliveAt'))->setValue($client, microtime(true) - 60.0);
 
         return $client;
@@ -113,8 +120,9 @@ final class NatsClientLivenessPingTest extends TestCase
     }
 
     /**
-     * Accepts one connection, sends INFO, delivers nothing, and answers the
-     * FIRST PING by its script (every later one at once):
+     * Accepts one connection, sends INFO, delivers nothing, answers the first
+     * PING (connect()) at once and the SECOND, the liveness check, by its
+     * script (every later one at once):
      *  - 'stray': the pull's "408 Request Timeout" status frame, then the PONG;
      *  - 'late':  the PONG after 1.3 s, past the client's 1 s read timeout;
      *  - 'dead':  nothing, ever.
@@ -151,7 +159,7 @@ final class NatsClientLivenessPingTest extends TestCase
                     if ($line !== 'PING') {
                         continue;
                     }
-                    if (++$pings > 1) {
+                    if (++$pings !== 2) {
                         fwrite($conn, "PONG\r\n");
                         continue;
                     }
