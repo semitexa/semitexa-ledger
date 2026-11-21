@@ -14,7 +14,7 @@
         "ext-sqlite3": "*",
         "semitexa/core": ">=2026.10.29.1052 || dev-master",
         "semitexa/orm": ">=2026.09.29.0833 || dev-master",
-        "basis-company/nats": "^1.1"
+        "basis-company/nats": "^1.2"
     },
     "autoload": {
         "psr-4": {
