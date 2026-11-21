@@ -469,7 +469,7 @@ final class NatsClient
             return;
         }
 
-        if (!$this->client()->ping()) {
+        if (!PingProbe::answered($this->client())) {
             throw new \RuntimeException('NATS connection did not answer PING; reconnecting.');
         }
         $this->aliveAt = $now;
