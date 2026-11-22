@@ -41,7 +41,12 @@ final class LedgerWriter
         private readonly string $nodeId,
         private readonly string $hmacKey,
         private readonly AggregateOwnershipService $ownership,
-    ) {}
+        private readonly int $hashVersion = EnvelopeSeal::CURRENT,
+    ) {
+        if (!EnvelopeSeal::supports($hashVersion)) {
+            throw new \InvalidArgumentException("Unknown ledger hash version: {$hashVersion}");
+        }
+    }
 
     /**
      * Append an event to the ledger.
@@ -108,9 +113,12 @@ final class LedgerWriter
             // Increment per-origin sequence and fetch previous hash.
             [$sequence, $prevHash] = $this->nextSequenceAndHash($db);
 
-            // Compute hash chain: SHA-256(prevHash || eventId || json(payload))
-            $hash = hash('sha256', $prevHash . $eventId . json_encode($payload, JSON_THROW_ON_ERROR));
-            $hmac = hash_hmac('sha256', $hash, $this->hmacKey);
+            // Hash chain + signature over the whole envelope (EnvelopeSeal).
+            $hash = EnvelopeSeal::hash(
+                $this->hashVersion, $prevHash, $eventId, $this->nodeId, $sequence, $domain,
+                $eventType, 1, $aggregateType, $aggregateId, $payload, $metadata, $now,
+            );
+            $hmac = EnvelopeSeal::hmac($this->hashVersion, $hash, $this->hmacKey);
 
             $record = new LedgerEvent(
                 eventId:       $eventId,
@@ -130,17 +138,18 @@ final class LedgerWriter
                 aggregateType: $aggregateType,
                 aggregateId:   $aggregateId,
                 publishStatus: 'pending',
+                hashVersion:   $this->hashVersion,
             );
 
             $db->execute(
                 'INSERT INTO events
                  (event_id, origin_node, sequence, domain, event_type, event_version,
                   aggregate_type, aggregate_id, payload, metadata, hash, prev_hash, hmac,
-                  source, publish_status, created_at)
+                  hash_version, source, publish_status, created_at)
                  VALUES
                  (:event_id, :origin_node, :sequence, :domain, :event_type, :event_version,
                   :aggregate_type, :aggregate_id, :payload, :metadata, :hash, :prev_hash, :hmac,
-                  :source, :publish_status, :created_at)',
+                  :hash_version, :source, :publish_status, :created_at)',
                 [
                     'event_id'       => $record->eventId,
                     'origin_node'    => $record->originNode,
@@ -155,6 +164,7 @@ final class LedgerWriter
                     'hash'           => $record->hash,
                     'prev_hash'      => $record->prevHash,
                     'hmac'           => $record->hmac,
+                    'hash_version'   => $record->hashVersion,
                     'source'         => $record->source,
                     'publish_status' => $record->publishStatus,
                     'created_at'     => $record->createdAt,

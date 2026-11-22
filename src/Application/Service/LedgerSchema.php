@@ -12,7 +12,7 @@ namespace Semitexa\Ledger\Application\Service;
  */
 final class LedgerSchema
 {
-    private const CURRENT_VERSION = 1;
+    private const CURRENT_VERSION = 2;
 
     public function __construct(
         private readonly LedgerConnection $db,
@@ -49,6 +49,7 @@ final class LedgerSchema
         $this->db->transaction(function (LedgerConnection $db) use ($version): void {
             match ($version) {
                 1 => $this->applyV1($db),
+                2 => $this->applyV2($db),
                 default => throw new \LogicException("Unknown schema version: {$version}"),
             };
 
@@ -168,5 +169,22 @@ final class LedgerSchema
         $db->execute(
             "INSERT OR IGNORE INTO ledger_meta (key, value) VALUES ('hmac_key_id', 'key-initial')"
         );
+    }
+
+    /**
+     * events.hash_version: which formula produced a row's hash and HMAC
+     * (EnvelopeSeal). Every row written before this column is version 1.
+     */
+    private function applyV2(LedgerConnection $db): void
+    {
+        // Workers race here at boot: each read the old schema_version before
+        // one of them took the lock. ALTER has no IF NOT EXISTS.
+        foreach ($db->fetchAll('PRAGMA table_info(events)') as $column) {
+            if (($column['name'] ?? null) === 'hash_version') {
+                return;
+            }
+        }
+
+        $db->getRaw()->exec('ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1');
     }
 }

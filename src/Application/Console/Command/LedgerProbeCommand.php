@@ -10,6 +10,7 @@ use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Console\BaseCommand;
 use Semitexa\Ledger\Application\Payload\Event\LedgerProbeRecorded;
 use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
+use Semitexa\Ledger\Application\Service\EnvelopeSeal;
 use Semitexa\Ledger\Application\Service\LedgerConnection;
 use Semitexa\Ledger\Application\Service\LedgerSchema;
 use Semitexa\Ledger\Application\Service\LedgerWriter;
@@ -80,7 +81,7 @@ final class LedgerProbeCommand extends BaseCommand
 
         $probeId = UuidV7::generate();
         $note    = Row::asString($input->getOption('note'));
-        $event   = (new LedgerWriter($db, $nodeId, $hmacKey, $ownership))
+        $event   = (new LedgerWriter($db, $nodeId, $hmacKey, $ownership, EnvelopeSeal::writeVersionFromEnv()))
             ->append(LedgerProbeRecorded::of($probeId, $note));
 
         if ($event === null) {

@@ -158,7 +158,7 @@ class LedgerBootstrap implements ServerLifecycleListenerInterface
         );
 
         // 4. Hook LedgerWriter into EventDispatcher.
-        $writer = new LedgerWriter($db, $nodeId, $hmacKey, $ownership);
+        $writer = new LedgerWriter($db, $nodeId, $hmacKey, $ownership, EnvelopeSeal::writeVersionFromEnv());
 
         /** @var EventDispatcher $dispatcher */
         $dispatcher = $container->get(EventDispatcher::class);

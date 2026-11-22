@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Semitexa\Ledger\Application\Console\Command;
 
 use Semitexa\Core\Attribute\AsCommand;
+use Semitexa\Ledger\Application\Service\EnvelopeSeal;
 use Semitexa\Ledger\Application\Service\LedgerConnection;
+use Semitexa\Ledger\Domain\Model\LedgerEvent;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -64,52 +66,54 @@ final class LedgerVerifyCommand extends Command
             $io->writeln("Verifying origin: <info>{$originNode}</info>");
 
             $events = $db->fetchAll(
-                'SELECT event_id, sequence, payload, hash, prev_hash, hmac
-                 FROM events WHERE origin_node = :origin ORDER BY sequence ASC',
+                'SELECT * FROM events WHERE origin_node = :origin ORDER BY sequence ASC',
                 ['origin' => $originNode]
             );
 
             $prevHash = hash('sha256', "genesis:{$originNode}");
 
-            foreach ($events as $event) {
-                $seq       = (int) $event['sequence'];
-                $eventId   = $event['event_id'];
-                $payload   = $event['payload'];
-                $hash      = $event['hash'];
-                $storedPrev = $event['prev_hash'];
-                $hmac      = $event['hmac'];
+            foreach ($events as $row) {
+                $event = LedgerEvent::fromRow($row);
 
-                if ($storedPrev !== $prevHash) {
+                if ($event->prevHash !== $prevHash) {
                     $io->error(sprintf(
                         '  seq=%d event_id=%s — prev_hash mismatch (expected=%s stored=%s)',
-                        $seq, $eventId, $prevHash, $storedPrev,
+                        $event->sequence, $event->eventId, $prevHash, $event->prevHash,
                     ));
                     $errors++;
                 }
 
-                $payloadArray = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
-                $expectedHash = hash('sha256', $prevHash . $eventId . json_encode($payloadArray, JSON_THROW_ON_ERROR));
+                if (!EnvelopeSeal::supports($event->hashVersion)) {
+                    $io->error(sprintf(
+                        '  seq=%d event_id=%s — unknown hash version %d',
+                        $event->sequence, $event->eventId, $event->hashVersion,
+                    ));
+                    $errors++;
+                    $prevHash = $event->hash;
+                    continue;
+                }
 
-                if ($hash !== $expectedHash) {
+                // Each row under the formula of its own hash version: version 1
+                // history stays verifiable beside version 2 events.
+                if ($event->hash !== EnvelopeSeal::hashOf($event, $prevHash)) {
                     $io->error(sprintf(
                         '  seq=%d event_id=%s — hash mismatch',
-                        $seq, $eventId,
+                        $event->sequence, $event->eventId,
                     ));
                     $errors++;
                 }
 
-                if ($hmacKey !== '') {
-                    $expectedHmac = hash_hmac('sha256', $hash, $hmacKey);
-                    if (!hash_equals($expectedHmac, $hmac)) {
-                        $io->error(sprintf(
-                            '  seq=%d event_id=%s — HMAC mismatch (possible tampering)',
-                            $seq, $eventId,
-                        ));
-                        $errors++;
-                    }
+                if ($hmacKey !== ''
+                    && !hash_equals(EnvelopeSeal::hmac($event->hashVersion, $event->hash, $hmacKey), $event->hmac)
+                ) {
+                    $io->error(sprintf(
+                        '  seq=%d event_id=%s — HMAC mismatch (possible tampering)',
+                        $event->sequence, $event->eventId,
+                    ));
+                    $errors++;
                 }
 
-                $prevHash = $hash;
+                $prevHash = $event->hash;
             }
 
             if ($errors === 0) {
