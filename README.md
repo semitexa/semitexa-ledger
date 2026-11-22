@@ -32,6 +32,14 @@ EVENTS_DUAL_SECONDARY=<other-transport>
 
 `EVENTS_TRANSPORT=dual` publishes to both transports and consumes from the primary. It holds a retry back when the primary can (NATS, database); a secondary that cannot gets the message at once.
 
+## What The Signature Covers
+
+Every event carries a hash that chains it to its origin's previous event, and an HMAC of that hash under `LEDGER_HMAC_KEY`. Since hash version 2 the hash covers the whole envelope: origin, sequence, domain, event type and version, aggregate, payload, metadata and creation time. A node quarantines an event whose envelope was changed after signing, and never applies it.
+
+Version 1, the first format, covered the event id and the payload only. Events written under it keep verifying under it, in the stored ledger (`ledger:verify`) and on the wire, and stay as weak as they were written. The version is the envelope's `hash_version` field (absent means 1) and the `events.hash_version` column. A version 2 signature is not accepted as a version 1 signature, so relabelling a new event as an old one does not verify.
+
+**Upgrading a running cluster.** A node that predates version 2 cannot verify version 2 events: it quarantines them and then waits on that origin's sequence. Either stop every node and upgrade them together, or upgrade one node at a time with `LEDGER_HASH_VERSION=1` set on each (it then reads both versions and still writes version 1) and remove the variable once every node runs the new code.
+
 ## Propagate Events
 
 Mark an event with `#[Propagated]` to persist it in the local ledger and publish it to other nodes.

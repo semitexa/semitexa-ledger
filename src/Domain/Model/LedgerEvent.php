@@ -37,13 +37,13 @@ final readonly class LedgerEvent
         /** Optional: correlation_id, causation_id, actor, timestamp, command_id. */
         public ?array $metadata,
 
-        /** SHA-256(prev_hash || event_id || json(payload)) */
+        /** SHA-256 over what $hashVersion covers — see EnvelopeSeal. */
         public string $hash,
 
         /** Hash of the previous event from the same origin_node. */
         public string $prevHash,
 
-        /** HMAC-SHA256 of hash, keyed by the node's HMAC key. */
+        /** HMAC-SHA256 of hash (labelled from hash version 2 on), keyed by the node's HMAC key. */
         public string $hmac,
 
         /** 'local' for events produced here, 'remote' for events received via NATS. */
@@ -66,6 +66,12 @@ final readonly class LedgerEvent
          * Managed by LedgerPublisher. Only meaningful for source='local'.
          */
         public string $publishStatus = 'pending',
+
+        /**
+         * Which formula produced hash and hmac: 1 = payload only (the first
+         * format), 2 = the whole envelope. See EnvelopeSeal.
+         */
+        public int $hashVersion = 1,
     ) {}
 
     /**
@@ -87,6 +93,7 @@ final readonly class LedgerEvent
             'hash'           => $this->hash,
             'prev_hash'      => $this->prevHash,
             'hmac'           => $this->hmac,
+            'hash_version'   => $this->hashVersion,
             'created_at'     => $this->createdAt,
         ], JSON_THROW_ON_ERROR);
     }
@@ -116,6 +123,8 @@ final readonly class LedgerEvent
             aggregateType: $data['aggregate_type'] ?? null,
             aggregateId:   $data['aggregate_id'] ?? null,
             publishStatus: 'published', // remote events are already published
+            // Absent on events from a node that predates versions.
+            hashVersion:   self::hashVersionOf(is_array($data) ? ($data['hash_version'] ?? null) : null),
         );
     }
 
@@ -146,6 +155,21 @@ final readonly class LedgerEvent
             aggregateType: isset($row['aggregate_type']) ? (string) $row['aggregate_type'] : null,
             aggregateId:   isset($row['aggregate_id']) ? (string) $row['aggregate_id'] : null,
             publishStatus: (string) ($row['publish_status'] ?? 'pending'),
+            hashVersion:   self::hashVersionOf($row['hash_version'] ?? null),
         );
+    }
+
+    /**
+     * Absent means 1: the first format carried no version. Anything that is
+     * not a whole number reads as 0, a version nothing verifies under.
+     */
+    private static function hashVersionOf(mixed $value): int
+    {
+        return match (true) {
+            $value === null                            => 1,
+            is_int($value)                             => $value,
+            is_string($value) && ctype_digit($value)   => (int) $value,
+            default                                    => 0,
+        };
     }
 }

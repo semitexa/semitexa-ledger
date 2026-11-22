@@ -25,8 +25,9 @@ use Semitexa\Ledger\Application\Service\AggregateOwnershipService;
  * Every message is acked or naked explicitly, and only after its outcome is
  * durable:
  *  1. origin_node == self        → ack (own events already in ledger).
- *  2. event_id already in ledger → ack, but first re-apply it if it was stored
- *                                  and never applied (a handler failed).
+ *  2. event_id already in ledger → ack, but first apply the STORED event if it
+ *                                  was never applied (a handler failed). The
+ *                                  delivery only names it; it is never applied.
  *  3. Sequence gap               → nak with a delay; the missing predecessor is
  *                                  in the stream and arrives first on redelivery.
  *     Earlier event unapplied    → nak with a delay: a handler never sees an
@@ -164,14 +165,20 @@ final class LedgerReplayer
 
         // Duplicate check by event_id.
         $existing = $this->db->fetchOne(
-            'SELECT hash, applied_at FROM events WHERE event_id = :id',
+            'SELECT * FROM events WHERE event_id = :id',
             ['id' => $event->eventId]
         );
 
         if ($existing !== null) {
-            if ($existing['hash'] !== $event->hash) {
-                $this->quarantine($event, (string) $existing['hash'], $sourceCluster);
-            } elseif ($existing['applied_at'] === null && !$this->applyAndMark($event, $msg)) {
+            // The stored row is the one that passed the chain and HMAC checks.
+            // This delivery passed none: a matching hash proves nothing about
+            // its payload or headers, so it only triggers the retry — what is
+            // applied is the row. A local row is never replayed onto its own
+            // node, whatever origin the delivery claims.
+            $stored = LedgerEvent::fromRow($existing);
+            if ($stored->hash !== $event->hash || $stored->originNode !== $event->originNode) {
+                $this->quarantine($event, $stored->hash, $sourceCluster);
+            } elseif ($stored->source === 'remote' && $stored->appliedAt === null && !$this->applyAndMark($stored, $msg)) {
                 return; // naked — the next delivery retries the apply
             }
             $this->ack($msg, $sourceCluster, $event->eventId);
@@ -225,18 +232,14 @@ final class LedgerReplayer
             return;
         }
 
-        // Hash chain verification.
-        $expectedChainHash = hash('sha256', $expectedHash . $event->eventId . json_encode($event->payload, JSON_THROW_ON_ERROR));
-        if ($event->hash !== $expectedChainHash) {
-            $this->quarantine($event, $expectedChainHash, $sourceCluster);
-            $this->ack($msg, $sourceCluster, $event->eventId);
-            return;
-        }
-
-        // HMAC verification.
-        $expectedHmac = hash_hmac('sha256', $event->hash, $this->hmacKey);
-        if (!hash_equals($expectedHmac, $event->hmac)) {
-            $this->quarantine($event, $expectedChainHash, $sourceCluster);
+        // Hash chain + HMAC verification, under the formula of the event's own
+        // hash version. An unknown version verifies under none.
+        if (!EnvelopeSeal::verifies($event, $expectedHash, $this->hmacKey)) {
+            $this->quarantine(
+                $event,
+                EnvelopeSeal::supports($event->hashVersion) ? EnvelopeSeal::hashOf($event, $expectedHash) : '',
+                $sourceCluster,
+            );
             $this->ack($msg, $sourceCluster, $event->eventId);
             return;
         }
@@ -249,11 +252,11 @@ final class LedgerReplayer
                 'INSERT OR IGNORE INTO events
                  (event_id, origin_node, sequence, domain, event_type, event_version,
                   aggregate_type, aggregate_id, payload, metadata, hash, prev_hash, hmac,
-                  source, publish_status, created_at)
+                  hash_version, source, publish_status, created_at)
                  VALUES
                  (:event_id, :origin_node, :sequence, :domain, :event_type, :event_version,
                   :aggregate_type, :aggregate_id, :payload, :metadata, :hash, :prev_hash, :hmac,
-                  :source, :publish_status, :created_at)',
+                  :hash_version, :source, :publish_status, :created_at)',
                 [
                     'event_id'       => $event->eventId,
                     'origin_node'    => $event->originNode,
@@ -268,6 +271,7 @@ final class LedgerReplayer
                     'hash'           => $event->hash,
                     'prev_hash'      => $event->prevHash,
                     'hmac'           => $event->hmac,
+                    'hash_version'   => $event->hashVersion,
                     'source'         => 'remote',
                     'publish_status' => 'published',
                     'created_at'     => $event->createdAt,
